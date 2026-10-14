@@ -1,5 +1,6 @@
 .streamlit/secrets.toml
 dashboards/*/history.json
 dashboards/*/log.jsonl
+oracle_client/
 __pycache__/
 .venv/

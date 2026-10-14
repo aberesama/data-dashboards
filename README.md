@@ -40,9 +40,9 @@ For a different database per dashboard, add an `[oracle_<name>]` section to secr
 `.streamlit/config.toml` makes the app listen on localhost only, so other machines on the network cannot open it. Do not remove it while credentials are saved in secrets.toml.
 
 ## Older Oracle databases (error DPY-3010)
-If the app says "connections to this database server version are not supported by python-oracledb in thin mode", your database is older than 12.1. Use thick mode:
-1. Download Oracle Instant Client 19c for your system. It must match your Python (64 bit Python needs 64 bit Instant Client). Basic or Basic Light is enough.
-2. Unzip it to a folder you can write to. No installer or admin rights are normally needed.
-3. In `.streamlit/secrets.toml`, under `[oracle]`, add `instant_client_dir = 'C:\path\to\instantclient_19_21'` (single quotes).
-4. Restart the app. The sidebar should say "Driver mode: thick (Instant Client)".
-Notes: thick mode is set once per app process, so restart after changing it. A query timeout needs Oracle Client 18c or newer.
+If the app says "connections to this database server version are not supported by python-oracledb in thin mode", your database is older than 12.1. Downgrading python-oracledb does not help, because thin mode never supported those versions. You need Oracle Instant Client 19c (thick mode), and the app can fetch it for you:
+1. In the sidebar open "Older database? Set up Oracle Client" and click "Download and set up". It downloads about 40 MB from download.oracle.com into the `oracle_client` folder (gitignored).
+2. If asked, stop and restart the app once. After that it finds the client automatically on every start and the sidebar says "Driver mode: thick (Instant Client)".
+3. Command line alternative: `python oracle_client.py`. On a machine that cannot reach download.oracle.com, download the Instant Client 19c Basic Light zip elsewhere and run `python oracle_client.py path/to/file.zip`.
+4. To use a client you installed yourself, set `instant_client_dir` under `[oracle]` in secrets.toml instead.
+Supported for the automatic download: 64 bit Windows and 64 bit Linux. On Linux, the client folder must be on LD_LIBRARY_PATH and libaio must be installed before starting Python. A query timeout needs Oracle Client 18c or newer. Oracle Instant Client is covered by Oracle's license terms, so check your bank's policy.

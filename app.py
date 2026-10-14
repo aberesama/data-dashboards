@@ -10,6 +10,8 @@ import oracledb
 import pandas as pd
 import streamlit as st
 
+import oracle_client
+
 DASH_DIR = Path("dashboards")
 CATEGORIES = ["Totals", "Nulls", "Invalids"]
 UNITS = ["count", "percent"]
@@ -109,7 +111,7 @@ READ_ONLY = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 TIMEOUT_CODES = ("DPI-1067", "DPI-1080", "DPY-4024")
 HINTS = {
     "DPY-3010": "This database is older than 12.1, so the default (thin) driver mode cannot connect. "
-                "Use thick mode: install Oracle Instant Client 19c and set instant_client_dir in secrets.toml (see README).",
+                "Open 'Older database? Set up Oracle Client' in the sidebar and click Download and set up.",
     "ORA-01017": "Wrong username or password. Do not keep retrying: repeated failures can lock the account.",
     "ORA-28000": "The account is locked. Ask your DBA to unlock it.",
     "ORA-12514": "The listener does not know this service name. Check the URL with your DBA.",
@@ -440,13 +442,35 @@ with st.sidebar:
 
     st.header("Connection")
     sec = get_credentials(slug)
-    lib_dir = get_credentials("").get("instant_client_dir", "")  # process wide, so only from [oracle]
+    # Thick mode is process wide, so the folder comes from [oracle] or from ./oracle_client, never per dashboard.
+    try:
+        lib_dir = get_credentials("").get("instant_client_dir") or oracle_client.find_client()
+    except RuntimeError:  # unsupported platform for the automatic setup
+        lib_dir = None
     if lib_dir:
         try:
             enable_thick_mode(lib_dir)
         except Exception as e:
             st.error("Could not load Oracle Instant Client, staying in thin mode: " + " ".join(str(e).split())[:300])
     st.caption("Driver mode: " + ("thin" if oracledb.is_thin_mode() else "thick (Instant Client)"))
+    if oracledb.is_thin_mode() and not lib_dir:
+        with st.expander("Older database? Set up Oracle Client"):
+            st.write("Databases older than 12.1 (error DPY-3010) need Oracle Instant Client 19c. "
+                     "This downloads it (about 40 MB) from download.oracle.com into the app's oracle_client folder.")
+            if st.button("Download and set up", key="setup_client"):
+                try:
+                    with st.status("Setting up Oracle Client...", expanded=True) as box:
+                        found = oracle_client.install(log=box.write)
+                        try:
+                            enable_thick_mode(found)
+                        except Exception:
+                            box.update(label="Downloaded. Stop and restart the app once to finish.", state="complete")
+                            st.warning("Downloaded, but thick mode can only be switched on at startup. Restart the app once.")
+                        else:
+                            box.update(label="Oracle Client ready.", state="complete")
+                            st.rerun()
+                except Exception as e:
+                    st.error(" ".join(str(e).split())[:500])
     url = st.text_input("Database URL (host:port/service)", sec.get("url", ""), key=f"url_{slug}")
     user = st.text_input("Username", sec.get("user", ""), key=f"user_{slug}")
     password = st.text_input("Password", sec.get("password", ""), type="password", key=f"pw_{slug}")
