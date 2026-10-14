@@ -46,6 +46,3 @@ If the app says "connections to this database server version are not supported b
 3. Command line alternative: `python oracle_client.py`. On a machine that cannot reach download.oracle.com, download the Instant Client 19c Basic Light zip elsewhere and run `python oracle_client.py path/to/file.zip`.
 4. To use a client you installed yourself, set `instant_client_dir` under `[oracle]` in secrets.toml instead.
 Supported for the automatic download: 64 bit Windows and 64 bit Linux. On Linux, the client folder must be on LD_LIBRARY_PATH and libaio must be installed before starting Python. A query timeout needs Oracle Client 18c or newer. Oracle Instant Client is covered by Oracle's license terms, so check your bank's policy.
-
-## ORA-12154 (could not resolve the connect identifier)
-The app turns `host:port/service` (or `host:port:SID`) into a full connect descriptor, so it works even when the machine's Oracle client configuration (sqlnet.ora) disables the short address style. If you still see ORA-12154, the URL field has a typo, a space or stray characters.
