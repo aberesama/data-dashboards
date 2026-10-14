@@ -38,3 +38,11 @@ For a different database per dashboard, add an `[oracle_<name>]` section to secr
 
 ## Network lock
 `.streamlit/config.toml` makes the app listen on localhost only, so other machines on the network cannot open it. Do not remove it while credentials are saved in secrets.toml.
+
+## Older Oracle databases (error DPY-3010)
+If the app says "connections to this database server version are not supported by python-oracledb in thin mode", your database is older than 12.1. Use thick mode:
+1. Download Oracle Instant Client 19c for your system. It must match your Python (64 bit Python needs 64 bit Instant Client). Basic or Basic Light is enough.
+2. Unzip it to a folder you can write to. No installer or admin rights are normally needed.
+3. In `.streamlit/secrets.toml`, under `[oracle]`, add `instant_client_dir = 'C:\path\to\instantclient_19_21'` (single quotes).
+4. Restart the app. The sidebar should say "Driver mode: thick (Instant Client)".
+Notes: thick mode is set once per app process, so restart after changing it. A query timeout needs Oracle Client 18c or newer.

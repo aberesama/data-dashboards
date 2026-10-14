@@ -108,14 +108,15 @@ def normalize_url(url):
 READ_ONLY = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 TIMEOUT_CODES = ("DPI-1067", "DPI-1080", "DPY-4024")
 HINTS = {
+    "DPY-3010": "This database is older than 12.1, so the default (thin) driver mode cannot connect. "
+                "Use thick mode: install Oracle Instant Client 19c and set instant_client_dir in secrets.toml (see README).",
     "ORA-01017": "Wrong username or password. Do not keep retrying: repeated failures can lock the account.",
     "ORA-28000": "The account is locked. Ask your DBA to unlock it.",
     "ORA-12514": "The listener does not know this service name. Check the URL with your DBA.",
     "ORA-12541": "Nothing is listening on that host and port.",
     "ORA-12170": "Connection timed out. Check you are on the bank network or VPN.",
     "DPY-6005": "Could not reach the database. Check the URL, port and that you are on the bank network or VPN.",
-    "DPY-3010": "Database version is too old for the default driver mode.",
-}
+}  # dict order is priority: the most specific cause comes first
 
 
 def describe_error(e, timeout_s):
@@ -124,14 +125,28 @@ def describe_error(e, timeout_s):
     codes = re.findall(r"(?:ORA|DPI|DPY)-\d+", text)
     if any(c in TIMEOUT_CODES for c in codes):
         return f"Timed out after {timeout_s:g}s ({codes[0]}). Query is too slow or blocked."
-    hint = next((HINTS[c] for c in codes if c in HINTS), "")
+    hint = next((h for code, h in HINTS.items() if code in codes), "")
     return (text[:500] + (" " + hint if hint else "")).strip()
 
 
+TIMEOUT_STATE = {"ok": True}
+
+
 def connect(url, user, password, timeout_s):
-    conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url), tcp_connect_timeout=15)
-    conn.call_timeout = int(timeout_s * 1000)  # milliseconds, per database round trip
+    kwargs = {"tcp_connect_timeout": 15} if oracledb.is_thin_mode() else {}
+    conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url), **kwargs)
+    try:
+        conn.call_timeout = int(timeout_s * 1000)  # milliseconds, per database round trip
+    except Exception:  # thick mode with an Oracle Client older than 18c
+        TIMEOUT_STATE["ok"] = False
     return conn
+
+
+@st.cache_resource
+def enable_thick_mode(lib_dir):
+    """Must run before the first connection. Raises on failure, so a failure is not cached."""
+    oracledb.init_oracle_client(lib_dir=lib_dir)
+    return lib_dir
 
 
 def is_healthy(conn):
@@ -425,6 +440,13 @@ with st.sidebar:
 
     st.header("Connection")
     sec = get_credentials(slug)
+    lib_dir = get_credentials("").get("instant_client_dir", "")  # process wide, so only from [oracle]
+    if lib_dir:
+        try:
+            enable_thick_mode(lib_dir)
+        except Exception as e:
+            st.error("Could not load Oracle Instant Client, staying in thin mode: " + " ".join(str(e).split())[:300])
+    st.caption("Driver mode: " + ("thin" if oracledb.is_thin_mode() else "thick (Instant Client)"))
     url = st.text_input("Database URL (host:port/service)", sec.get("url", ""), key=f"url_{slug}")
     user = st.text_input("Username", sec.get("user", ""), key=f"user_{slug}")
     password = st.text_input("Password", sec.get("password", ""), type="password", key=f"pw_{slug}")
@@ -452,12 +474,15 @@ with tab_dash:
                 bar.progress(i / n)
                 status.info(f"Running {i + 1} of {n}: {name} (timeout {timeout_s:g}s per tile)")
 
+            TIMEOUT_STATE["ok"] = True
             try:
                 abort = refresh_tiles(slug, to_run, history, (url, user, password), timeout_s, on_progress)
             except Exception as e:
                 abort = "Connection failed: " + describe_error(e, timeout_s)
             bar.empty()
             status.empty()
+            if not TIMEOUT_STATE["ok"]:
+                st.warning("Your Oracle Client is older than 18c, so the query timeout is NOT enforced. Use Instant Client 19c.")
             failed = sum(1 for t in to_run if history.get(t["id"], {}).get("error"))
             if abort:
                 st.error(abort)
