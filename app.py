@@ -102,9 +102,23 @@ def get_credentials(slug):
 
 def normalize_url(url):
     """Accept a pasted JDBC style URL and reduce it to host:port/service."""
-    url = url.strip()
+    url = url.strip().strip("\"'").strip()
     url = re.sub(r"^jdbc:oracle:thin:@", "", url, flags=re.IGNORECASE)
     return url.lstrip("/")
+
+
+def build_dsn(url):
+    """host:port/service or host:port:SID becomes a full connect descriptor, which needs no name
+    resolution. This avoids ORA-12154 on machines whose Oracle client config disables Easy Connect.
+    Anything else (a TNS alias, a ready made descriptor) is passed through unchanged."""
+    url = normalize_url(url)
+    m = re.fullmatch(r"([^:/\s()]+):(\d+)/([^\s()]+)", url)
+    if m:
+        return oracledb.makedsn(m[1], int(m[2]), service_name=m[3])
+    m = re.fullmatch(r"([^:/\s()]+):(\d+):([^\s()/]+)", url)
+    if m:
+        return oracledb.makedsn(m[1], int(m[2]), sid=m[3])
+    return url
 
 
 READ_ONLY = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
@@ -112,6 +126,8 @@ TIMEOUT_CODES = ("DPI-1067", "DPI-1080", "DPY-4024")
 HINTS = {
     "DPY-3010": "This database is older than 12.1, so the default (thin) driver mode cannot connect. "
                 "Open 'Older database? Set up Oracle Client' in the sidebar and click Download and set up.",
+    "ORA-12154": "Oracle could not understand the connection string. Check the URL field has no spaces, quotes or extra characters, "
+                 "and looks like host:port/service_name.",
     "ORA-01017": "Wrong username or password. Do not keep retrying: repeated failures can lock the account.",
     "ORA-28000": "The account is locked. Ask your DBA to unlock it.",
     "ORA-12514": "The listener does not know this service name. Check the URL with your DBA.",
@@ -136,7 +152,7 @@ TIMEOUT_STATE = {"ok": True}
 
 def connect(url, user, password, timeout_s):
     kwargs = {"tcp_connect_timeout": 15} if oracledb.is_thin_mode() else {}
-    conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url), **kwargs)
+    conn = oracledb.connect(user=user, password=password, dsn=build_dsn(url), **kwargs)
     try:
         conn.call_timeout = int(timeout_s * 1000)  # milliseconds, per database round trip
     except Exception:  # thick mode with an Oracle Client older than 18c
