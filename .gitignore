@@ -1,4 +1,5 @@
 .streamlit/secrets.toml
 dashboards/*/history.json
+dashboards/*/log.jsonl
 __pycache__/
 .venv/

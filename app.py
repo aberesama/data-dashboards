@@ -5,11 +5,14 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import altair as alt
 import oracledb
+import pandas as pd
 import streamlit as st
 
 DASH_DIR = Path("dashboards")
 CATEGORIES = ["Totals", "Nulls", "Invalids"]
+UNITS = ["count", "percent"]
 # Totals going up is good; nulls and invalids going down is good.
 HIGHER_IS_BETTER = {"Totals": True, "Nulls": False, "Invalids": False}
 
@@ -157,9 +160,38 @@ def run_scalar(conn, sql):
     return float(row[0])
 
 
+def append_log(slug, rows):
+    """Append one JSON line per successful tile refresh. Never rewritten, so history is kept."""
+    if not rows:
+        return
+    path = DASH_DIR / slug / "log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def load_log(slug, tile_id=None):
+    path = DASH_DIR / slug / "log.jsonl"
+    out = []
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if tile_id is None or r.get("tile") == tile_id:
+                    out.append(r)
+    except FileNotFoundError:
+        pass
+    return out
+
+
 def refresh_tiles(slug, tiles, history, creds, timeout_s, on_progress):
     """Run tiles one at a time, saving after each. Returns an abort message or None."""
     conn = connect(*creds, timeout_s)
+    logged = {r.get("tile") for r in load_log(slug)}
     try:
         for i, t in enumerate(tiles):
             on_progress(i, len(tiles), t["name"])
@@ -183,8 +215,12 @@ def refresh_tiles(slug, tiles, history, creds, timeout_s, on_progress):
                 h["elapsed"] = round(time.monotonic() - started, 1)
                 if "baseline" not in h:
                     h["baseline"] = {"value": value, "ts": now}
+                if h.get("last") and t["id"] not in logged:  # dashboards created before the log existed
+                    append_log(slug, [{"ts": h["last"]["ts"], "tile": t["id"], "value": h["last"]["value"]}])
                 h["previous"] = h.get("last")
                 h["last"] = {"value": value, "ts": now}
+                append_log(slug, [{"ts": now, "tile": t["id"], "value": value}])
+                logged.add(t["id"])
             save_json(DASH_DIR / slug / "history.json", history)  # keep progress if interrupted
     finally:
         close_quietly(conn)  # also runs if Streamlit aborts the script, which ends the session
@@ -203,25 +239,31 @@ def lock_baselines(slug, history):
 
 
 # ---------- rendering ----------
-def fmt(n):
+def fmt(n, unit="count"):
+    if unit == "percent":
+        return f"{n:,.2f}%"
     return f"{n:,.0f}" if float(n).is_integer() else f"{n:,.2f}"
 
 
-def delta_html(label, delta, higher_is_better, pct=None):
+def delta_html(label, delta, higher_is_better, pct=None, unit="count"):
     if delta is None:
         return f'<div class="delta flat">{label}: n/a</div>'
-    if delta == 0:
+    if round(delta, 6) == 0:
         return f'<div class="delta flat">{label}: no change</div>'
     cls = "good" if (delta > 0) == higher_is_better else "bad"
     arrow = "▲" if delta > 0 else "▼"
-    extra = f" ({pct:+.1f}%)" if pct is not None else ""
-    return f'<div class="delta">{label}: <span class="{cls}">{arrow} {fmt(abs(delta))}{extra}</span></div>'
+    if unit == "percent":  # change of a percentage is shown in percentage points
+        text = f"{abs(delta):,.2f} pp"
+    else:
+        text = fmt(abs(delta)) + (f" ({pct:+.1f}%)" if pct is not None else "")
+    return f'<div class="delta">{label}: <span class="{cls}">{arrow} {text}</span></div>'
 
 
 def tile_html(t, h):
     h = h or {}
     last = h.get("last")
     hib = HIGHER_IS_BETTER.get(t.get("category"), True)
+    unit = t.get("unit", "count")
     name = t["name"].replace("<", "&lt;")
     if not last:
         body = '<div class="num">-</div><div class="delta flat">Not refreshed yet</div>'
@@ -234,10 +276,10 @@ def tile_html(t, h):
         d_last = v - prev["value"] if prev else None
         took = f' (took {h["elapsed"]:g}s)' if h.get("elapsed") is not None and not h.get("error") else ""
         body = (
-            f'<div class="num">{fmt(v)}</div>'
-            + delta_html("Since last refresh", d_last, hib)
-            + delta_html("Since start", d_start, hib, pct)
-            + (f'<div class="delta flat">Baseline {fmt(base["value"])} ({base["ts"][:10]})</div>' if base else "")
+            f'<div class="num">{fmt(v, unit)}</div>'
+            + delta_html("Since last refresh", d_last, hib, unit=unit)
+            + delta_html("Since start", d_start, hib, pct, unit)
+            + (f'<div class="delta flat">Baseline {fmt(base["value"], unit)} ({base["ts"][:10]})</div>' if base else "")
             + f'<div class="delta flat">As at {last["ts"].replace("T", " ")}{took}</div>'
         )
     if h.get("error"):
@@ -250,6 +292,44 @@ def tile_html(t, h):
 def request_refresh(ids):
     """Button callback. ids=None means every tile."""
     st.session_state["refresh_ids"] = ids if ids is not None else "all"
+
+
+@st.dialog("Progress", width="large")
+def show_trend(slug, t, history):
+    unit = t.get("unit", "count")
+    st.subheader(t["name"])
+    rows = load_log(slug, t["id"])
+    if not rows:
+        st.info("No refresh history yet for this tile. Refresh it at least once.")
+        return
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.sort_values("ts").set_index("ts")
+    base = (history.get(t["id"]) or {}).get("baseline")
+    axis = "Percent" if unit == "percent" else "Count"
+    line = alt.Chart(df.reset_index()).mark_line(point=True).encode(
+        x=alt.X("ts:T", title=None),
+        y=alt.Y("value:Q", title=axis, scale=alt.Scale(zero=False)),  # zero=False so real movement is visible
+        tooltip=[alt.Tooltip("ts:T", title="When"), alt.Tooltip("value:Q", title=axis, format=",.2f")],
+    )
+    layers = [line]
+    if base:
+        layers.append(
+            alt.Chart(pd.DataFrame({"y": [base["value"]]})).mark_rule(strokeDash=[6, 4], color="#9ca3af").encode(y="y:Q")
+        )
+    st.altair_chart(alt.layer(*layers).properties(height=320, width="container"))
+    if base:
+        st.caption(f"Dashed line is the baseline ({fmt(base['value'], unit)}).")
+    hib = HIGHER_IS_BETTER.get(t.get("category"), True)
+    best = df["value"].max() if hib else df["value"].min()
+    latest = df["value"].iloc[-1]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Latest", fmt(latest, unit))
+    c2.metric("Best so far", fmt(best, unit))
+    c3.metric("First recorded", fmt(df["value"].iloc[0], unit))
+    with st.expander("All refreshes"):
+        table = df[["value"]].rename(columns={"value": "Value"}).sort_index(ascending=False)
+        st.dataframe(table)
 
 
 def render_dashboard(slug, cfg, history):
@@ -268,7 +348,10 @@ def render_dashboard(slug, cfg, history):
             cols = st.columns(ncols)
             for col, t in zip(cols, group[i : i + ncols]):
                 col.markdown(tile_html(t, history.get(t["id"])), unsafe_allow_html=True)
-                col.button("↻ Refresh this tile", key=f"r_{slug}_{t['id']}", on_click=request_refresh, args=([t["id"]],))
+                b1, b2 = col.columns(2)
+                b1.button("↻ Refresh", key=f"r_{slug}_{t['id']}", on_click=request_refresh, args=([t["id"]],))
+                if b2.button("Trend", key=f"v_{slug}_{t['id']}"):
+                    show_trend(slug, t, history)
 
 
 def render_editor(slug, cfg, history):
@@ -290,6 +373,11 @@ def render_editor(slug, cfg, history):
                 "Category", CATEGORIES,
                 index=CATEGORIES.index(t["category"]) if t.get("category") in CATEGORIES else 0,
                 key=f"c_{k}",
+            )
+            t["unit"] = st.selectbox(
+                "Unit", UNITS, index=UNITS.index(t["unit"]) if t.get("unit") in UNITS else 0, key=f"u_{k}",
+                help="count: the query returns a number. percent: the query returns the percentage itself, "
+                     "e.g. 100 * SUM(CASE WHEN bad THEN 1 ELSE 0 END) / COUNT(*).",
             )
             t["sql"] = st.text_area("SQL", t["sql"], height=120, key=f"q_{k}")
             if st.button("Delete tile", key=f"d_{k}"):

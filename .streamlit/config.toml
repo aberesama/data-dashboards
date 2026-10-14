@@ -1,0 +1,4 @@
+[server]
+# Only this machine can open the dashboard. Without this, Streamlit also listens on the
+# network, so anyone who can reach your laptop could use the saved database login.
+address = "localhost"
