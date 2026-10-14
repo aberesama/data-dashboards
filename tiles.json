@@ -1,0 +1,9 @@
+{
+  "columns": 4,
+  "tiles": [
+    {"id": "t1", "name": "Total records", "category": "Totals", "sql": "SELECT COUNT(*) FROM your_table"},
+    {"id": "t2", "name": "Total profiled", "category": "Totals", "sql": "SELECT COUNT(*) FROM your_table WHERE profiled_flag = 'Y'"},
+    {"id": "t3", "name": "Null phone numbers", "category": "Nulls", "sql": "SELECT COUNT(*) FROM your_table WHERE phone IS NULL"},
+    {"id": "t4", "name": "Invalid emails", "category": "Invalids", "sql": "SELECT COUNT(*) FROM your_table WHERE email NOT LIKE '%@%'"}
+  ]
+}
