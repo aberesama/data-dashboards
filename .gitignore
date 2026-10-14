@@ -1,4 +1,4 @@
 .streamlit/secrets.toml
-history.json
+dashboards/*/history.json
 __pycache__/
 .venv/
