@@ -12,10 +12,14 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+
+# One refresh at a time per app process, so tabs and reruns can never open extra database sessions.
+REFRESH_LOCK = threading.Lock()
 
 BASE = Path(__file__).resolve().parent / "oracle_client"
 # Newest first. Oracle keeps older point releases, so fall through if one is missing.

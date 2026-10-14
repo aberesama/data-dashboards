@@ -46,3 +46,12 @@ If the app says "connections to this database server version are not supported b
 3. Command line alternative: `python oracle_client.py`. On a machine that cannot reach download.oracle.com, download the Instant Client 19c Basic Light zip elsewhere and run `python oracle_client.py path/to/file.zip`.
 4. To use a client you installed yourself, set `instant_client_dir` under `[oracle]` in secrets.toml instead.
 Supported for the automatic download: 64 bit Windows and 64 bit Linux. On Linux, the client folder must be on LD_LIBRARY_PATH and libaio must be installed before starting Python. A query timeout needs Oracle Client 18c or newer. Oracle Instant Client is covered by Oracle's license terms, so check your bank's policy.
+
+## Refresh ALL dashboards and database sessions
+- "Refresh ALL dashboards" in the sidebar runs every tile of every dashboard, one at a time, on **one** database session that is reused throughout and closed at the end. Each dashboard keeps its own query timeout.
+- Logins: the open dashboard uses what is in the sidebar. Other dashboards use their own `[oracle_<name>]` section in secrets.toml, else `[oracle]`, else the sidebar values. Dashboards that share a login share the session. A different login means the first session is closed before the next opens, so there are never two at once.
+- A login that fails is not tried again in the same run (repeated bad logins can lock the account); dashboards sharing it are skipped.
+- Only one refresh can run at a time in the app. A second click, tab or rerun is refused with a message instead of opening another session.
+- Do not click anything while a refresh runs. A click restarts the page. Finished tiles are kept and the session is closed.
+- The session is labelled `Profiling Dashboard` in V$SESSION.MODULE. To see what it holds, a DBA can run: `SELECT sid, serial#, status, last_call_et, machine, module FROM v$session WHERE module = 'Profiling Dashboard'`.
+- This app cannot cap sessions on the database side. A dedicated account with its own SESSIONS_PER_USER limit stops it ever starving other applications; ask your DBA.

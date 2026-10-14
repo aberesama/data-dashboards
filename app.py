@@ -137,11 +137,19 @@ TIMEOUT_STATE = {"ok": True}
 def connect(url, user, password, timeout_s):
     kwargs = {"tcp_connect_timeout": 15} if oracledb.is_thin_mode() else {}
     conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url), **kwargs)
+    set_timeout(conn, timeout_s)
+    try:
+        conn.module = "Profiling Dashboard"  # shows in V$SESSION.MODULE so the DBA can identify this app
+    except Exception:
+        pass
+    return conn
+
+
+def set_timeout(conn, timeout_s):
     try:
         conn.call_timeout = int(timeout_s * 1000)  # milliseconds, per database round trip
     except Exception:  # thick mode with an Oracle Client older than 18c
         TIMEOUT_STATE["ok"] = False
-    return conn
 
 
 @st.cache_resource
@@ -205,43 +213,111 @@ def load_log(slug, tile_id=None):
     return out
 
 
-def refresh_tiles(slug, tiles, history, creds, timeout_s, on_progress):
-    """Run tiles one at a time, saving after each. Returns an abort message or None."""
-    conn = connect(*creds, timeout_s)
+class DbSession:
+    """Holds at most ONE open database connection, reused for every tile and every dashboard."""
+
+    def __init__(self):
+        self.conn = None
+        self.creds = None
+
+    def open(self, creds, timeout_s):
+        if self.conn is not None and self.creds == creds and is_healthy(self.conn):
+            set_timeout(self.conn, timeout_s)
+            return self.conn
+        self.close()  # never two sessions at once: close the old one before opening another
+        self.conn = connect(*creds, timeout_s)
+        self.creds = creds
+        return self.conn
+
+    def reset(self, timeout_s):
+        creds = self.creds
+        self.close()
+        return self.open(creds, timeout_s)
+
+    def close(self):
+        if self.conn is not None:
+            close_quietly(self.conn)
+        self.conn = None
+
+
+def refresh_tiles(slug, tiles, history, session, creds, timeout_s, on_progress):
+    """Run tiles one at a time on the shared session, saving after each. Returns an abort message or None."""
     logged = {r.get("tile") for r in load_log(slug)}
-    try:
-        for i, t in enumerate(tiles):
-            on_progress(i, len(tiles), t["name"])
-            h = history.setdefault(t["id"], {})
-            started = time.monotonic()
-            try:
-                value = run_scalar(conn, t["sql"])
-            except Exception as e:  # one bad query must not kill the rest
-                h["error"] = describe_error(e, timeout_s)
-                h["elapsed"] = round(time.monotonic() - started, 1)
-                if not is_healthy(conn):  # a timeout can invalidate the connection
-                    close_quietly(conn)
-                    try:
-                        conn = connect(*creds, timeout_s)
-                    except Exception as e2:
-                        save_json(DASH_DIR / slug / "history.json", history)
-                        return "Lost the database connection and could not reconnect: " + describe_error(e2, timeout_s)
-            else:
-                now = datetime.now().isoformat(timespec="seconds")
-                h.pop("error", None)
-                h["elapsed"] = round(time.monotonic() - started, 1)
-                if "baseline" not in h:
-                    h["baseline"] = {"value": value, "ts": now}
-                if h.get("last") and t["id"] not in logged:  # dashboards created before the log existed
-                    append_log(slug, [{"ts": h["last"]["ts"], "tile": t["id"], "value": h["last"]["value"]}])
-                h["previous"] = h.get("last")
-                h["last"] = {"value": value, "ts": now}
-                append_log(slug, [{"ts": now, "tile": t["id"], "value": value}])
-                logged.add(t["id"])
-            save_json(DASH_DIR / slug / "history.json", history)  # keep progress if interrupted
-    finally:
-        close_quietly(conn)  # also runs if Streamlit aborts the script, which ends the session
+    session.open(creds, timeout_s)
+    for i, t in enumerate(tiles):
+        on_progress(i, len(tiles), t["name"])
+        h = history.setdefault(t["id"], {})
+        started = time.monotonic()
+        try:
+            value = run_scalar(session.conn, t["sql"])
+        except Exception as e:  # one bad query must not kill the rest
+            h["error"] = describe_error(e, timeout_s)
+            h["elapsed"] = round(time.monotonic() - started, 1)
+            if not is_healthy(session.conn):  # a timeout can invalidate the connection
+                try:
+                    session.reset(timeout_s)
+                except Exception as e2:
+                    save_json(DASH_DIR / slug / "history.json", history)
+                    return "Lost the database connection and could not reconnect: " + describe_error(e2, timeout_s)
+        else:
+            now = datetime.now().isoformat(timespec="seconds")
+            h.pop("error", None)
+            h["elapsed"] = round(time.monotonic() - started, 1)
+            if "baseline" not in h:
+                h["baseline"] = {"value": value, "ts": now}
+            if h.get("last") and t["id"] not in logged:  # dashboards created before the log existed
+                append_log(slug, [{"ts": h["last"]["ts"], "tile": t["id"], "value": h["last"]["value"]}])
+            h["previous"] = h.get("last")
+            h["last"] = {"value": value, "ts": now}
+            append_log(slug, [{"ts": now, "tile": t["id"], "value": value}])
+            logged.add(t["id"])
+        save_json(DASH_DIR / slug / "history.json", history)  # keep progress if interrupted
     return None
+
+
+def run_jobs(jobs, histories, on_progress):
+    """Run one or many dashboards on ONE database session, one tile at a time.
+
+    jobs: list of dicts with slug, tiles, creds (url, user, password) and timeout_s.
+    Returns (rows, error). rows has one summary dict per dashboard.
+    """
+    if not oracle_client.REFRESH_LOCK.acquire(blocking=False):
+        return [], "Another refresh is already running in this app. Wait for it to finish, then try again."
+    TIMEOUT_STATE["ok"] = True
+    session = DbSession()
+    rows, bad_logins, done = [], set(), 0
+    total = sum(len(j["tiles"]) for j in jobs)
+    try:
+        for j in jobs:
+            slug, tiles = j["slug"], j["tiles"]
+            row = {"Dashboard": slug, "Tiles": len(tiles), "Failed": 0, "Note": ""}
+            rows.append(row)
+            if not all(j["creds"]):
+                row["Note"] = "Skipped: URL, username or password missing"
+                done += len(tiles)
+                continue
+            if j["creds"] in bad_logins:  # never retry a login that just failed: repeated failures lock accounts
+                row["Note"] = "Skipped: the same login already failed"
+                done += len(tiles)
+                continue
+
+            def progress(i, n, name, slug=slug, base=done):
+                on_progress(base + i, total, slug, name)
+
+            try:
+                abort = refresh_tiles(slug, tiles, histories[slug], session, j["creds"], j["timeout_s"], progress)
+            except Exception as e:  # could not connect at all, so no tile of this dashboard was refreshed
+                abort = "Connection failed: " + describe_error(e, j["timeout_s"])
+                bad_logins.add(j["creds"])
+                row["Failed"] = len(tiles)
+            else:
+                row["Failed"] = sum(1 for t in tiles if histories[slug].get(t["id"], {}).get("error"))
+            row["Note"] = abort or ""
+            done += len(tiles)
+    finally:
+        session.close()  # also runs if Streamlit stops the script, which ends the database session
+        oracle_client.REFRESH_LOCK.release()
+    return rows, None
 
 
 def lock_baselines(slug, history):
@@ -307,7 +383,7 @@ def tile_html(t, h):
 
 
 def request_refresh(ids):
-    """Button callback. ids=None means every tile."""
+    """Button callback. ids=None means every tile of the open dashboard; "everything" means every dashboard."""
     st.session_state["refresh_ids"] = ids if ids is not None else "all"
 
 
@@ -476,6 +552,8 @@ with st.sidebar:
     password = st.text_input("Password", sec.get("password", ""), type="password", key=f"pw_{slug}")
     st.caption("Prefilled from .streamlit/secrets.toml if present.")
     st.button("Refresh all tiles", type="primary", use_container_width=True, on_click=request_refresh, args=(None,))
+    st.button(f"Refresh ALL dashboards ({len(dashboards)})", use_container_width=True, on_click=request_refresh, args=("everything",),
+              help="Runs every tile of every dashboard one after another on a single database session.")
 
 cfg = load_config(slug)
 history = load_json(DASH_DIR / slug / "history.json", {})
@@ -486,34 +564,55 @@ tab_dash, tab_edit = st.tabs(["Dashboard", "Edit tiles"])
 with tab_dash:
     wanted = st.session_state.pop("refresh_ids", None)
     if wanted:
-        to_run = cfg["tiles"] if wanted == "all" else [t for t in cfg["tiles"] if t["id"] in wanted]
-        if not (url and user and password):
-            st.error("URL, username and password are required.")
-        elif to_run:
-            timeout_s = float(cfg["timeout_seconds"])
+        typed = (url, user, password)  # what is in the sidebar right now, for the open dashboard
+
+        def creds_for(dash):
+            if dash == slug:
+                return typed
+            sec_d = get_credentials(dash)  # other dashboards: their secrets, else whatever is typed in the sidebar
+            return (sec_d.get("url"), sec_d.get("user"), sec_d.get("password")) if all(
+                sec_d.get(k) for k in ("url", "user", "password")) else typed
+
+        if wanted == "everything":
+            histories, jobs = {}, []
+            for dash in dashboards:
+                c = cfg if dash == slug else load_config(dash)
+                histories[dash] = history if dash == slug else load_json(DASH_DIR / dash / "history.json", {})
+                jobs.append({"slug": dash, "tiles": c["tiles"], "creds": creds_for(dash), "timeout_s": float(c["timeout_seconds"])})
+        else:
+            to_run = cfg["tiles"] if wanted == "all" else [t for t in cfg["tiles"] if t["id"] in wanted]
+            histories = {slug: history}
+            jobs = [{"slug": slug, "tiles": to_run, "creds": typed, "timeout_s": float(cfg["timeout_seconds"])}]
+
+        total = sum(len(j["tiles"]) for j in jobs)
+        if total:
+            started = time.monotonic()
             bar = st.progress(0.0)
             status = st.empty()
 
-            def on_progress(i, n, name):
+            def on_progress(i, n, dash, name):
                 bar.progress(i / n)
-                status.info(f"Running {i + 1} of {n}: {name} (timeout {timeout_s:g}s per tile)")
+                status.info(f"{dash}: {name} (tile {i + 1} of {n}, one database session, do not click anything until finished)")
 
-            TIMEOUT_STATE["ok"] = True
-            try:
-                abort = refresh_tiles(slug, to_run, history, (url, user, password), timeout_s, on_progress)
-            except Exception as e:
-                abort = "Connection failed: " + describe_error(e, timeout_s)
+            rows, err = run_jobs(jobs, histories, on_progress)
             bar.empty()
             status.empty()
-            if not TIMEOUT_STATE["ok"]:
-                st.warning("Your Oracle Client is older than 18c, so the query timeout is NOT enforced. Use Instant Client 19c.")
-            failed = sum(1 for t in to_run if history.get(t["id"], {}).get("error"))
-            if abort:
-                st.error(abort)
-            elif failed:
-                st.warning(f"Refreshed {len(to_run) - failed} of {len(to_run)} tiles. {failed} failed, see the red notes on those tiles.")
+            if err:
+                st.warning(err)
             else:
-                st.success(f"Refreshed {len(to_run)} tile(s).")
+                if not TIMEOUT_STATE["ok"]:
+                    st.warning("Your Oracle Client is older than 18c, so the query timeout is NOT enforced. Use Instant Client 19c.")
+                failed = sum(r["Failed"] for r in rows)
+                notes = [r for r in rows if r["Note"]]
+                took = f" in {int(time.monotonic() - started) // 60}m {int(time.monotonic() - started) % 60}s"
+                if len(rows) > 1:
+                    st.dataframe(pd.DataFrame(rows), hide_index=True)
+                for r in notes:
+                    (st.error if len(rows) == 1 else st.warning)(f"{r['Dashboard']}: {r['Note']}")
+                if failed and not notes:
+                    st.warning(f"Refreshed {total - failed} of {total} tiles{took}. {failed} failed, see the red notes on those tiles.")
+                elif not notes:
+                    st.success(f"Refreshed {total} tile(s){took}.")
     render_dashboard(slug, cfg, history)
 
     with st.expander("Lock baseline"):
