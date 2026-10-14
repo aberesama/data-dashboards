@@ -251,12 +251,12 @@ def delta_html(label, delta, higher_is_better, pct=None, unit="count"):
     if round(delta, 6) == 0:
         return f'<div class="delta flat">{label}: no change</div>'
     cls = "good" if (delta > 0) == higher_is_better else "bad"
-    sign = "+" if delta > 0 else "-"
+    arrow = "▲" if delta > 0 else "▼"
     if unit == "percent":  # change of a percentage is shown in percentage points
-        text = f"{sign}{abs(delta):,.2f} pp"
+        text = f"{abs(delta):,.2f} pp"
     else:
-        text = f"{sign}{fmt(abs(delta))}" + (f" ({pct:+.1f}%)" if pct is not None else "")
-    return f'<div class="delta">{label}: <span class="{cls}">{text}</span></div>'
+        text = fmt(abs(delta)) + (f" ({pct:+.1f}%)" if pct is not None else "")
+    return f'<div class="delta">{label}: <span class="{cls}">{arrow} {text}</span></div>'
 
 
 def tile_html(t, h):
