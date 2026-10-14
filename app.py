@@ -1,6 +1,6 @@
 import json
 import re
-import shutil
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -19,14 +19,14 @@ st.markdown(
     """
     <style>
     .tile {border:2px solid #1f2937; border-radius:6px; padding:14px 16px;
-           background:#f9fafb; margin-bottom:16px; min-height:190px;}
+           background:#f9fafb; margin-bottom:6px; min-height:190px;}
     .tile .name {font-size:.75rem; letter-spacing:.08em; text-transform:uppercase;
                  color:#4b5563; font-weight:600; border-bottom:1px solid #d1d5db;
                  padding-bottom:6px; margin-bottom:8px;}
     .tile .num {font-size:2.4rem; font-weight:700; color:#111827; line-height:1.1;}
     .tile .delta {font-size:.85rem; margin-top:6px; color:#374151;}
     .good {color:#047857; font-weight:600;} .bad {color:#b91c1c; font-weight:600;}
-    .flat {color:#6b7280;} .err {color:#b91c1c; font-size:.8rem;}
+    .flat {color:#6b7280;} .err {color:#b91c1c; font-size:.8rem; margin-top:8px;}
     @media (prefers-color-scheme: dark) {
       .tile {background:#111827; border-color:#6b7280;}
       .tile .name {color:#9ca3af; border-color:#374151;}
@@ -80,6 +80,7 @@ def load_config(slug):
     cfg = load_json(DASH_DIR / slug / "tiles.json", {})
     cfg.setdefault("title", slug)
     cfg.setdefault("columns", 4)
+    cfg.setdefault("timeout_seconds", 300)
     cfg.setdefault("tiles", [])
     return cfg
 
@@ -102,6 +103,46 @@ def normalize_url(url):
 
 
 READ_ONLY = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+TIMEOUT_CODES = ("DPI-1067", "DPI-1080", "DPY-4024")
+HINTS = {
+    "ORA-01017": "Wrong username or password. Do not keep retrying: repeated failures can lock the account.",
+    "ORA-28000": "The account is locked. Ask your DBA to unlock it.",
+    "ORA-12514": "The listener does not know this service name. Check the URL with your DBA.",
+    "ORA-12541": "Nothing is listening on that host and port.",
+    "ORA-12170": "Connection timed out. Check you are on the bank network or VPN.",
+    "DPY-6005": "Could not reach the database. Check the URL, port and that you are on the bank network or VPN.",
+    "DPY-3010": "Database version is too old for the default driver mode.",
+}
+
+
+def describe_error(e, timeout_s):
+    """Turn a driver exception into a short message that keeps the Oracle error code."""
+    text = " ".join(str(e).split())
+    codes = re.findall(r"(?:ORA|DPI|DPY)-\d+", text)
+    if any(c in TIMEOUT_CODES for c in codes):
+        return f"Timed out after {timeout_s:g}s ({codes[0]}). Query is too slow or blocked."
+    hint = next((HINTS[c] for c in codes if c in HINTS), "")
+    return (text[:500] + (" " + hint if hint else "")).strip()
+
+
+def connect(url, user, password, timeout_s):
+    conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url), tcp_connect_timeout=15)
+    conn.call_timeout = int(timeout_s * 1000)  # milliseconds, per database round trip
+    return conn
+
+
+def is_healthy(conn):
+    try:
+        return conn.is_healthy()
+    except Exception:
+        return False
+
+
+def close_quietly(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def run_scalar(conn, sql):
@@ -116,21 +157,38 @@ def run_scalar(conn, sql):
     return float(row[0])
 
 
-def refresh_all(conn, slug, tiles, history):
-    now = datetime.now().isoformat(timespec="seconds")
-    for t in tiles:
-        h = history.setdefault(t["id"], {})
-        try:
-            value = run_scalar(conn, t["sql"])
-        except Exception as e:  # one bad query must not kill the rest
-            h["error"] = str(e)[:300]
-            continue
-        h.pop("error", None)
-        if "baseline" not in h:
-            h["baseline"] = {"value": value, "ts": now}
-        h["previous"] = h.get("last")
-        h["last"] = {"value": value, "ts": now}
-    save_json(DASH_DIR / slug / "history.json", history)
+def refresh_tiles(slug, tiles, history, creds, timeout_s, on_progress):
+    """Run tiles one at a time, saving after each. Returns an abort message or None."""
+    conn = connect(*creds, timeout_s)
+    try:
+        for i, t in enumerate(tiles):
+            on_progress(i, len(tiles), t["name"])
+            h = history.setdefault(t["id"], {})
+            started = time.monotonic()
+            try:
+                value = run_scalar(conn, t["sql"])
+            except Exception as e:  # one bad query must not kill the rest
+                h["error"] = describe_error(e, timeout_s)
+                h["elapsed"] = round(time.monotonic() - started, 1)
+                if not is_healthy(conn):  # a timeout can invalidate the connection
+                    close_quietly(conn)
+                    try:
+                        conn = connect(*creds, timeout_s)
+                    except Exception as e2:
+                        save_json(DASH_DIR / slug / "history.json", history)
+                        return "Lost the database connection and could not reconnect: " + describe_error(e2, timeout_s)
+            else:
+                now = datetime.now().isoformat(timespec="seconds")
+                h.pop("error", None)
+                h["elapsed"] = round(time.monotonic() - started, 1)
+                if "baseline" not in h:
+                    h["baseline"] = {"value": value, "ts": now}
+                h["previous"] = h.get("last")
+                h["last"] = {"value": value, "ts": now}
+            save_json(DASH_DIR / slug / "history.json", history)  # keep progress if interrupted
+    finally:
+        close_quietly(conn)  # also runs if Streamlit aborts the script, which ends the session
+    return None
 
 
 def lock_baselines(slug, history):
@@ -161,14 +219,11 @@ def delta_html(label, delta, higher_is_better, pct=None):
 
 
 def tile_html(t, h):
-    last = (h or {}).get("last")
+    h = h or {}
+    last = h.get("last")
     hib = HIGHER_IS_BETTER.get(t.get("category"), True)
     name = t["name"].replace("<", "&lt;")
-    if h and h.get("error"):
-        err = h["error"].replace("<", "&lt;")
-        num = fmt(last["value"]) if last else "-"
-        body = f'<div class="num">{num}</div><div class="err">Query error: {err}</div>'
-    elif not last:
+    if not last:
         body = '<div class="num">-</div><div class="delta flat">Not refreshed yet</div>'
     else:
         v = last["value"]
@@ -177,17 +232,27 @@ def tile_html(t, h):
         pct = d_start / base["value"] * 100 if base and base["value"] else None
         prev = h.get("previous")
         d_last = v - prev["value"] if prev else None
+        took = f' (took {h["elapsed"]:g}s)' if h.get("elapsed") is not None and not h.get("error") else ""
         body = (
             f'<div class="num">{fmt(v)}</div>'
             + delta_html("Since last refresh", d_last, hib)
             + delta_html("Since start", d_start, hib, pct)
-            + f'<div class="delta flat">Baseline {fmt(base["value"])} ({base["ts"][:10]})</div>'
-            + f'<div class="delta flat">As at {last["ts"].replace("T", " ")}</div>'
+            + (f'<div class="delta flat">Baseline {fmt(base["value"])} ({base["ts"][:10]})</div>' if base else "")
+            + f'<div class="delta flat">As at {last["ts"].replace("T", " ")}{took}</div>'
         )
+    if h.get("error"):
+        err = h["error"].replace("<", "&lt;")
+        lead = "Showing last good value. " if last else ""
+        body += f'<div class="err">Last refresh failed. {lead}{err}</div>'
     return f'<div class="tile"><div class="name">{name}</div>{body}</div>'
 
 
-def render_dashboard(cfg, history):
+def request_refresh(ids):
+    """Button callback. ids=None means every tile."""
+    st.session_state["refresh_ids"] = ids if ids is not None else "all"
+
+
+def render_dashboard(slug, cfg, history):
     tiles = cfg["tiles"]
     if not tiles:
         st.info("No tiles yet. Add some in the Edit tiles tab.")
@@ -203,12 +268,19 @@ def render_dashboard(cfg, history):
             cols = st.columns(ncols)
             for col, t in zip(cols, group[i : i + ncols]):
                 col.markdown(tile_html(t, history.get(t["id"])), unsafe_allow_html=True)
+                col.button("↻ Refresh this tile", key=f"r_{slug}_{t['id']}", on_click=request_refresh, args=([t["id"]],))
 
 
 def render_editor(slug, cfg, history):
     st.caption("Rename tiles, set their category, paste SQL. Each query must return one row with the number in the first column.")
     cfg["title"] = st.text_input("Dashboard title", cfg["title"], key=f"title_{slug}")
-    cfg["columns"] = st.slider("Tiles per row", 1, 6, int(cfg["columns"]), key=f"cols_{slug}")
+    c1, c2 = st.columns(2)
+    cfg["columns"] = c1.slider("Tiles per row", 1, 6, int(cfg["columns"]), key=f"cols_{slug}")
+    cfg["timeout_seconds"] = c2.number_input(
+        "Query timeout (seconds, per tile)", min_value=10, max_value=3600, step=30,
+        value=int(cfg["timeout_seconds"]), key=f"timeout_{slug}",
+        help="A query that runs longer is abandoned and the tile keeps its last good value.",
+    )
     to_delete = None
     for t in cfg["tiles"]:
         k = f'{slug}_{t["id"]}'
@@ -228,12 +300,12 @@ def render_editor(slug, cfg, history):
         save_json(DASH_DIR / slug / "tiles.json", cfg)
         save_json(DASH_DIR / slug / "history.json", history)
         st.rerun()
-    c1, c2 = st.columns(2)
-    if c1.button("Add tile", key=f"add_{slug}"):
+    b1, b2 = st.columns(2)
+    if b1.button("Add tile", key=f"add_{slug}"):
         cfg["tiles"].append({"id": uuid.uuid4().hex[:8], "name": "New tile", "category": "Totals", "sql": "SELECT COUNT(*) FROM dual"})
         save_json(DASH_DIR / slug / "tiles.json", cfg)
         st.rerun()
-    if c2.button("Save changes", type="primary", key=f"save_{slug}"):
+    if b2.button("Save changes", type="primary", key=f"save_{slug}"):
         save_json(DASH_DIR / slug / "tiles.json", cfg)
         st.success(f"Saved to dashboards/{slug}/tiles.json")
 
@@ -257,8 +329,8 @@ with st.sidebar:
     st.header("Dashboard")
     slug = st.selectbox("Open dashboard", dashboards, key="current_dashboard")
     with st.expander("New dashboard"):
-        new_title = st.text_input("Name", key="new_title")
-        copy_src = st.selectbox("Start from", ["Blank"] + dashboards, index=dashboards.index(slug) + 1, key="new_src")
+        st.text_input("Name", key="new_title")
+        st.selectbox("Start from", ["Blank"] + dashboards, index=dashboards.index(slug) + 1, key="new_src")
         st.button("Create", on_click=on_create)
         if st.session_state.get("create_err"):
             st.error(st.session_state.pop("create_err"))
@@ -269,7 +341,7 @@ with st.sidebar:
     user = st.text_input("Username", sec.get("user", ""), key=f"user_{slug}")
     password = st.text_input("Password", sec.get("password", ""), type="password", key=f"pw_{slug}")
     st.caption("Prefilled from .streamlit/secrets.toml if present.")
-    do_refresh = st.button("Refresh all tiles", type="primary", use_container_width=True)
+    st.button("Refresh all tiles", type="primary", use_container_width=True, on_click=request_refresh, args=(None,))
 
 cfg = load_config(slug)
 history = load_json(DASH_DIR / slug / "history.json", {})
@@ -278,20 +350,34 @@ st.title(cfg["title"])
 tab_dash, tab_edit = st.tabs(["Dashboard", "Edit tiles"])
 
 with tab_dash:
-    if do_refresh:
+    wanted = st.session_state.pop("refresh_ids", None)
+    if wanted:
+        to_run = cfg["tiles"] if wanted == "all" else [t for t in cfg["tiles"] if t["id"] in wanted]
         if not (url and user and password):
             st.error("URL, username and password are required.")
-        else:
+        elif to_run:
+            timeout_s = float(cfg["timeout_seconds"])
+            bar = st.progress(0.0)
+            status = st.empty()
+
+            def on_progress(i, n, name):
+                bar.progress(i / n)
+                status.info(f"Running {i + 1} of {n}: {name} (timeout {timeout_s:g}s per tile)")
+
             try:
-                with st.spinner("Running queries..."):
-                    conn = oracledb.connect(user=user, password=password, dsn=normalize_url(url))
-                    try:
-                        refresh_all(conn, slug, cfg["tiles"], history)
-                    finally:
-                        conn.close()
+                abort = refresh_tiles(slug, to_run, history, (url, user, password), timeout_s, on_progress)
             except Exception as e:
-                st.error(f"Connection failed: {e}")
-    render_dashboard(cfg, history)
+                abort = "Connection failed: " + describe_error(e, timeout_s)
+            bar.empty()
+            status.empty()
+            failed = sum(1 for t in to_run if history.get(t["id"], {}).get("error"))
+            if abort:
+                st.error(abort)
+            elif failed:
+                st.warning(f"Refreshed {len(to_run) - failed} of {len(to_run)} tiles. {failed} failed, see the red notes on those tiles.")
+            else:
+                st.success(f"Refreshed {len(to_run)} tile(s).")
+    render_dashboard(slug, cfg, history)
 
     with st.expander("Lock baseline"):
         st.write("Sets every tile's starting point to its latest refreshed value. 'Since start' and the percentage are measured from here.")
