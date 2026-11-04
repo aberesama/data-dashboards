@@ -2,3 +2,13 @@
 # Only this machine can open the dashboard. Without this, Streamlit also listens on the
 # network, so anyone who can reach your laptop could use the saved database login.
 address = "localhost"
+
+# Needs Streamlit 1.51 or newer. Define BOTH light and dark: a single [theme] section
+# stops Streamlit following the system light/dark setting.
+[theme.light]
+# Family Bank blue, sampled from the logo.
+primaryColor = "#2A5BA8"
+
+[theme.dark]
+# A lighter shade of the brand blue (derived, not official) so tab labels stay readable on dark.
+primaryColor = "#3D82DB"

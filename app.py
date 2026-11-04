@@ -23,19 +23,25 @@ st.set_page_config(page_title="Profiling Progress", layout="wide")
 st.markdown(
     """
     <style>
-    .tile {border:2px solid #1f2937; border-radius:6px; padding:14px 16px;
-           background:#f9fafb; margin-bottom:6px; min-height:190px;}
+    /* Family Bank palette. Blue #2A5BA8 sampled from the logo, cyan #2AABE4 from the bank's site stylesheet and logo.
+       The navy is a darker shade of the blue, not an official colour. Green and red keep their meaning (better and worse). */
+    :root {--fb-blue:#2A5BA8; --fb-cyan:#2AABE4; --fb-navy:#173A73;}
+    .stApp h1 {color:var(--fb-blue) !important;}
+    .tile {border:1px solid #cbd5e1; border-top:6px solid var(--fb-blue); border-radius:4px; padding:14px 16px;
+           background:#ffffff; margin-bottom:6px; min-height:190px; box-shadow:0 1px 3px rgba(23,58,115,.12);}
     .tile .name {font-size:.75rem; letter-spacing:.08em; text-transform:uppercase;
-                 color:#4b5563; font-weight:600; border-bottom:1px solid #d1d5db;
+                 color:var(--fb-blue); font-weight:700; border-bottom:1px solid #e2e8f0;
                  padding-bottom:6px; margin-bottom:8px;}
-    .tile .num {font-size:2.4rem; font-weight:700; color:#111827; line-height:1.1;}
-    .tile .delta {font-size:.85rem; margin-top:6px; color:#374151;}
+    .tile .num {font-size:2.4rem; font-weight:700; color:var(--fb-navy); line-height:1.1;}
+    .tile .delta {font-size:.85rem; margin-top:6px; color:#334155;}
     .good {color:#047857; font-weight:600;} .bad {color:#b91c1c; font-weight:600;}
-    .flat {color:#6b7280;} .err {color:#b91c1c; font-size:.8rem; margin-top:8px;}
+    .flat {color:#64748b;} .err {color:#b91c1c; font-size:.8rem; margin-top:8px;}
     @media (prefers-color-scheme: dark) {
-      .tile {background:#111827; border-color:#6b7280;}
-      .tile .name {color:#9ca3af; border-color:#374151;}
-      .tile .num {color:#f9fafb;} .tile .delta {color:#d1d5db;}
+      .stApp h1 {color:var(--fb-cyan) !important;}
+      .tile {background:#0f1b33; border-color:#2b3f66; border-top-color:var(--fb-cyan); box-shadow:none;}
+      .tile .name {color:var(--fb-cyan); border-color:#2b3f66;}
+      .tile .num {color:#ffffff;} .tile .delta {color:#cbd5e1;}
+      .good {color:#34d399;} .bad {color:#f87171;} .flat {color:#94a3b8;} .err {color:#f87171;}
     }
     </style>
     """,
@@ -400,7 +406,7 @@ def show_trend(slug, t, history):
     df = df.sort_values("ts").set_index("ts")
     base = (history.get(t["id"]) or {}).get("baseline")
     axis = "Percent" if unit == "percent" else "Count"
-    line = alt.Chart(df.reset_index()).mark_line(point=True).encode(
+    line = alt.Chart(df.reset_index()).mark_line(point=alt.OverlayMarkDef(color="#2A5BA8"), color="#2A5BA8").encode(
         x=alt.X("ts:T", title=None),
         y=alt.Y("value:Q", title=axis, scale=alt.Scale(zero=False)),  # zero=False so real movement is visible
         tooltip=[alt.Tooltip("ts:T", title="When"), alt.Tooltip("value:Q", title=axis, format=",.2f")],
@@ -408,7 +414,7 @@ def show_trend(slug, t, history):
     layers = [line]
     if base:
         layers.append(
-            alt.Chart(pd.DataFrame({"y": [base["value"]]})).mark_rule(strokeDash=[6, 4], color="#9ca3af").encode(y="y:Q")
+            alt.Chart(pd.DataFrame({"y": [base["value"]]})).mark_rule(strokeDash=[6, 4], color="#2AABE4").encode(y="y:Q")
         )
     st.altair_chart(alt.layer(*layers).properties(height=320, width="container"))
     if base:

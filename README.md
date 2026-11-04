@@ -55,3 +55,7 @@ Supported for the automatic download: 64 bit Windows and 64 bit Linux. On Linux,
 - Do not click anything while a refresh runs. A click restarts the page. Finished tiles are kept and the session is closed.
 - The session is labelled `Profiling Dashboard` in V$SESSION.MODULE. To see what it holds, a DBA can run: `SELECT sid, serial#, status, last_call_et, machine, module FROM v$session WHERE module = 'Profiling Dashboard'`.
 - This app cannot cap sessions on the database side. A dedicated account with its own SESSIONS_PER_USER limit stops it ever starving other applications; ask your DBA.
+
+## Colours
+The look follows the Family Bank palette: blue `#2A5BA8` (sampled from the logo) and cyan `#2AABE4` (used on the bank's own website and visible in the logo). A darker navy and a lighter blue for dark mode are derived shades, not official colours. Green and red on the tiles keep their meaning (better and worse). Confirm the exact values with the bank's brand guidelines if you have them, and change them in `app.py` (the `--fb-*` variables) and `.streamlit/config.toml`.
+The theme sections in `config.toml` need Streamlit 1.51 or newer (`pip install -U streamlit`). Keep both `[theme.light]` and `[theme.dark]`: a single `[theme]` section makes the app ignore your system's dark mode.
