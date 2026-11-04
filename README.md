@@ -59,3 +59,14 @@ Supported for the automatic download: 64 bit Windows and 64 bit Linux. On Linux,
 ## Colours
 The look follows the Family Bank palette: blue `#2A5BA8` (sampled from the logo) and cyan `#2AABE4` (used on the bank's own website and visible in the logo). A darker navy and a lighter blue for dark mode are derived shades, not official colours. Green and red on the tiles keep their meaning (better and worse). Confirm the exact values with the bank's brand guidelines if you have them, and change them in `app.py` (the `--fb-*` variables) and `.streamlit/config.toml`.
 The theme sections in `config.toml` need Streamlit 1.51 or newer (`pip install -U streamlit`). Keep both `[theme.light]` and `[theme.dark]`: a single `[theme]` section makes the app ignore your system's dark mode.
+
+## Filters
+Filters let people narrow the numbers by date, by a value picked from the database, or by typed text. They are placeholders in your tile SQL, so a tile only reacts to a filter if its SQL mentions it.
+1. Edit tiles tab, Filters section, Add filter. Give it a label, a bind name (for example `branch`) and a type. For a dropdown, give an options query such as `SELECT DISTINCT branch_name FROM branches ORDER BY 1`.
+2. Under each filter the app shows the line to add to a tile's SQL, for example `AND (:branch IS NULL OR branch_name = :branch)`. A date range creates two binds, `:created_from` and `:created_to`, and the end date includes the whole day. For "several values" dropdowns the values arrive joined by commas, so use the `INSTR` pattern shown (values must not contain commas).
+3. On the Dashboard tab open Filters, pick values and click **Apply filters**. The database is queried only then, on one session, and only for tiles that use a filter. Dropdown values load when you click their Load button (first 500 rows, kept in memory only).
+4. Filtered numbers are a **view only**. They are never written to history, baselines or Trend, change columns are not shown, and tiles that do not use the filters are dimmed. Any normal refresh, or Clear filters, returns to the normal view.
+5. Normal refreshes still work on tiles with placeholders: unset filters are sent as NULL, meaning no restriction. Bind names cannot be Oracle reserved words (such as `date` or `user`); the app warns about a partial list.
+
+## Header and logo
+Every page shows a Family Bank Limited bar at the top. To show the official logo instead, put your copy at `assets/logo.png` (or `.jpg`, `.svg`). It is gitignored on purpose, so the bank's trademark files are not pushed to GitHub unless you decide otherwise.

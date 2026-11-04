@@ -1,8 +1,10 @@
+import base64
 import json
 import re
 import time
 import uuid
 from datetime import datetime
+from datetime import time as dtime
 from pathlib import Path
 
 import altair as alt
@@ -15,6 +17,13 @@ import oracle_client
 DASH_DIR = Path("dashboards")
 CATEGORIES = ["Totals", "Nulls", "Invalids"]
 UNITS = ["count", "percent"]
+ORG_NAME = "Family Bank Limited"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"  # optional: put your official logo here as logo.png, logo.jpg or logo.svg
+FILTER_TYPES = ["date_range", "choice", "text"]
+FILTER_LABELS = {"date_range": "Date range", "choice": "Dropdown loaded from the database", "text": "Free text"}
+NAME_OK = re.compile(r"[a-z][a-z0-9_]{0,19}")
+RESERVED = {"date", "number", "user", "level", "size", "comment", "from", "to", "select", "where", "group", "order",
+            "table", "start", "end", "uid", "rowid", "rownum", "sysdate", "session", "access", "null", "and", "or", "not"}  # partial list
 # Totals going up is good; nulls and invalids going down is good.
 HIGHER_IS_BETTER = {"Totals": True, "Nulls": False, "Invalids": False}
 
@@ -36,6 +45,13 @@ st.markdown(
     .tile .delta {font-size:.85rem; margin-top:6px; color:#334155;}
     .good {color:#047857; font-weight:600;} .bad {color:#b91c1c; font-weight:600;}
     .flat {color:#64748b;} .err {color:#b91c1c; font-size:.8rem; margin-top:8px;}
+    .tile.filtered {border-top-color:var(--fb-cyan);}
+    .tile.unaffected {opacity:.5;}
+    .fb-bar {background:var(--fb-blue); color:#ffffff; padding:10px 18px; border-radius:4px; border-bottom:4px solid var(--fb-cyan);
+             display:flex; align-items:center; gap:14px; margin-bottom:8px;}
+    .fb-bar img {height:34px;}
+    .fb-bar .fb-name {font-weight:700; letter-spacing:.14em; font-size:.95rem;}
+    .fb-bar .fb-sub {opacity:.85; font-size:.85rem; margin-left:auto;}
     @media (prefers-color-scheme: dark) {
       .stApp h1 {color:var(--fb-cyan) !important;}
       .tile {background:#0f1b33; border-color:#2b3f66; border-top-color:var(--fb-cyan); box-shadow:none;}
@@ -92,6 +108,7 @@ def load_config(slug):
     cfg.setdefault("title", slug)
     cfg.setdefault("columns", 4)
     cfg.setdefault("timeout_seconds", 300)
+    cfg.setdefault("filters", [])
     cfg.setdefault("tiles", [])
     return cfg
 
@@ -179,12 +196,52 @@ def close_quietly(conn):
         pass
 
 
-def run_scalar(conn, sql):
+BIND_RE = re.compile(r"(?<![\w:]):([A-Za-z][A-Za-z0-9_]*)")
+
+
+def filter_bind_names(f):
+    return [f["name"] + "_from", f["name"] + "_to"] if f["type"] == "date_range" else [f["name"]]
+
+
+def tile_uses_filters(t, filters):
+    mine = {n.lower() for n in BIND_RE.findall(t["sql"])}
+    return bool(mine & {b for f in filters for b in filter_bind_names(f)})
+
+
+def bind_plan(filters, values=None):
+    """Bind values for every filter. With no values everything is None, meaning 'no restriction'."""
+    values, binds, dates = values or {}, {}, set()
+    for f in filters:
+        v = values.get(f["id"])
+        if f["type"] == "date_range":
+            v = v or {}
+            lo, hi = v.get("from"), v.get("to")
+            binds[f["name"] + "_from"] = datetime.combine(lo, dtime.min) if lo else None
+            binds[f["name"] + "_to"] = datetime.combine(hi, dtime(23, 59, 59)) if hi else None  # whole end day included
+            dates |= {f["name"] + "_from", f["name"] + "_to"}
+        elif f["type"] == "choice":
+            if isinstance(v, (list, tuple)):
+                v = ",".join(v)
+            binds[f["name"]] = v or None
+        else:
+            binds[f["name"]] = (v or "").strip() or None
+    return binds, dates
+
+
+def run_scalar(conn, sql, binds=None, dates=()):
     sql = sql.strip().rstrip(";").strip()
     if not READ_ONLY.match(sql):
         raise ValueError("Only SELECT or WITH queries are allowed.")
+    # Only pass binds the statement actually mentions, because Oracle rejects extra ones.
+    use = {n: binds[n.lower()] for n in BIND_RE.findall(sql) if binds and n.lower() in binds}
     with conn.cursor() as cur:
-        cur.execute(sql)
+        if use:
+            date_keys = {n: oracledb.DB_TYPE_DATE for n in use if n.lower() in dates}
+            if date_keys:
+                cur.setinputsizes(**date_keys)
+            cur.execute(sql, use)
+        else:
+            cur.execute(sql)
         row = cur.fetchone()
     if row is None or row[0] is None:
         return 0
@@ -246,7 +303,7 @@ class DbSession:
         self.conn = None
 
 
-def refresh_tiles(slug, tiles, history, session, creds, timeout_s, on_progress):
+def refresh_tiles(slug, tiles, history, session, creds, timeout_s, on_progress, unset=None):
     """Run tiles one at a time on the shared session, saving after each. Returns an abort message or None."""
     logged = {r.get("tile") for r in load_log(slug)}
     session.open(creds, timeout_s)
@@ -255,7 +312,7 @@ def refresh_tiles(slug, tiles, history, session, creds, timeout_s, on_progress):
         h = history.setdefault(t["id"], {})
         started = time.monotonic()
         try:
-            value = run_scalar(session.conn, t["sql"])
+            value = run_scalar(session.conn, t["sql"], *(unset or ({}, set())))
         except Exception as e:  # one bad query must not kill the rest
             h["error"] = describe_error(e, timeout_s)
             h["elapsed"] = round(time.monotonic() - started, 1)
@@ -311,7 +368,7 @@ def run_jobs(jobs, histories, on_progress):
                 on_progress(base + i, total, slug, name)
 
             try:
-                abort = refresh_tiles(slug, tiles, histories[slug], session, j["creds"], j["timeout_s"], progress)
+                abort = refresh_tiles(slug, tiles, histories[slug], session, j["creds"], j["timeout_s"], progress, j.get("unset"))
             except Exception as e:  # could not connect at all, so no tile of this dashboard was refreshed
                 abort = "Connection failed: " + describe_error(e, j["timeout_s"])
                 bad_logins.add(j["creds"])
@@ -324,6 +381,56 @@ def run_jobs(jobs, histories, on_progress):
         session.close()  # also runs if Streamlit stops the script, which ends the database session
         oracle_client.REFRESH_LOCK.release()
     return rows, None
+
+
+def run_with_session(creds, timeout_s, work):
+    """Run work(session) on one short lived session under the app wide lock. Returns (result, error)."""
+    if not oracle_client.REFRESH_LOCK.acquire(blocking=False):
+        return None, "Another refresh is already running in this app. Wait for it to finish, then try again."
+    TIMEOUT_STATE["ok"] = True
+    session = DbSession()
+    try:
+        session.open(creds, timeout_s)
+        return work(session), None
+    except Exception as e:
+        return None, "Could not run: " + describe_error(e, timeout_s)
+    finally:
+        session.close()
+        oracle_client.REFRESH_LOCK.release()
+
+
+def run_filtered(session, tiles, binds, dates, timeout_s, on_progress):
+    """Run tiles with filter values. Results are returned for display only and never saved."""
+    out = {}
+    for i, t in enumerate(tiles):
+        on_progress(i, len(tiles), t["name"])
+        started = time.monotonic()
+        try:
+            out[t["id"]] = {"value": run_scalar(session.conn, t["sql"], binds, dates)}
+        except Exception as e:
+            out[t["id"]] = {"error": describe_error(e, timeout_s)}
+            if not is_healthy(session.conn):
+                try:
+                    session.reset(timeout_s)
+                except Exception as e2:
+                    for rest in tiles[i + 1:]:
+                        out[rest["id"]] = {"error": "Lost the database connection: " + describe_error(e2, timeout_s)}
+                    out[t["id"]]["elapsed"] = round(time.monotonic() - started, 1)
+                    for r in out.values():
+                        r.setdefault("elapsed", 0.0)
+                    return out
+        out[t["id"]]["elapsed"] = round(time.monotonic() - started, 1)
+    return out
+
+
+def load_options(conn, sql, cap=500):
+    sql = sql.strip().rstrip(";").strip()
+    if not READ_ONLY.match(sql):
+        raise ValueError("Only SELECT or WITH queries are allowed.")
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchmany(cap + 1)
+    return {"values": [str(r[0]) for r in rows[:cap] if r[0] is not None], "truncated": len(rows) > cap}
 
 
 def lock_baselines(slug, history):
@@ -358,12 +465,20 @@ def delta_html(label, delta, higher_is_better, pct=None, unit="count"):
     return f'<div class="delta">{label}: <span class="{cls}">{arrow} {text}</span></div>'
 
 
-def tile_html(t, h):
+def tile_html(t, h, mode=None, fr=None):
     h = h or {}
     last = h.get("last")
     hib = HIGHER_IS_BETTER.get(t.get("category"), True)
     unit = t.get("unit", "count")
     name = t["name"].replace("<", "&lt;")
+    if mode == "filtered":
+        if fr.get("error"):
+            body = '<div class="num">-</div><div class="err">' + fr["error"].replace("<", "&lt;") + "</div>"
+        else:
+            body = (f'<div class="num">{fmt(fr["value"], unit)}</div>'
+                    '<div class="delta flat">Filtered view, not saved</div>'
+                    f'<div class="delta flat">Took {fr.get("elapsed", 0):g}s</div>')
+        return f'<div class="tile filtered"><div class="name">{name}</div>{body}</div>'
     if not last:
         body = '<div class="num">-</div><div class="delta flat">Not refreshed yet</div>'
     else:
@@ -385,7 +500,9 @@ def tile_html(t, h):
         err = h["error"].replace("<", "&lt;")
         lead = "Showing last good value. " if last else ""
         body += f'<div class="err">Last refresh failed. {lead}{err}</div>'
-    return f'<div class="tile"><div class="name">{name}</div>{body}</div>'
+    if mode == "unaffected":
+        body += '<div class="delta flat">Not affected by the filters</div>'
+    return f'<div class="{"tile unaffected" if mode == "unaffected" else "tile"}"><div class="name">{name}</div>{body}</div>'
 
 
 def request_refresh(ids):
@@ -431,7 +548,7 @@ def show_trend(slug, t, history):
         st.dataframe(table)
 
 
-def render_dashboard(slug, cfg, history):
+def render_dashboard(slug, cfg, history, fview=None):
     tiles = cfg["tiles"]
     if not tiles:
         st.info("No tiles yet. Add some in the Edit tiles tab.")
@@ -446,11 +563,135 @@ def render_dashboard(slug, cfg, history):
         for i in range(0, len(group), ncols):
             cols = st.columns(ncols)
             for col, t in zip(cols, group[i : i + ncols]):
-                col.markdown(tile_html(t, history.get(t["id"])), unsafe_allow_html=True)
+                mode, fr = None, None
+                if fview:
+                    fr = fview["tiles"].get(t["id"])
+                    mode = "filtered" if fr and tile_uses_filters(t, cfg["filters"]) else "unaffected"
+                col.markdown(tile_html(t, history.get(t["id"]), mode, fr), unsafe_allow_html=True)
                 b1, b2 = col.columns(2)
                 b1.button("↻ Refresh", key=f"r_{slug}_{t['id']}", on_click=request_refresh, args=([t["id"]],))
                 if b2.button("Trend", key=f"v_{slug}_{t['id']}"):
                     show_trend(slug, t, history)
+
+
+def filter_summary(filters, values):
+    parts = []
+    for f in filters:
+        v = values.get(f["id"])
+        if f["type"] == "date_range":
+            lo, hi = (v or {}).get("from"), (v or {}).get("to")
+            if lo or hi:
+                parts.append(f'{f["label"]}: {lo or "any"} to {hi or "any"}')
+        elif v and (not isinstance(v, str) or v.strip()):
+            parts.append(f'{f["label"]}: {", ".join(v) if isinstance(v, list) else v.strip()}')
+    return "; ".join(parts) or "no filter values set"
+
+
+def clear_filters(slug, filters):
+    st.session_state.pop(f"fview_{slug}", None)
+    for f in filters:
+        key = f"ff_{slug}_{f['id']}"
+        if f["type"] == "date_range":
+            st.session_state[key + "_from"] = None
+            st.session_state[key + "_to"] = None
+        elif f["type"] == "choice":
+            st.session_state[key] = [] if f.get("multi") else "All"
+        else:
+            st.session_state[key] = ""
+
+
+def render_filters(slug, cfg, creds):
+    """Filter panel. Returns the active filtered view (or None). Queries the database only when Apply is clicked."""
+    filters = cfg["filters"]
+    if not filters:
+        return None
+    fview = st.session_state.get(f"fview_{slug}")
+    timeout_s = float(cfg["timeout_seconds"])
+    with st.expander("Filters", expanded=bool(fview)):
+        st.caption("Pick values, then click Apply. Only tiles whose SQL uses these filters are queried. "
+                   "Filtered numbers are a view only: nothing is saved, and baselines and Trend are not affected.")
+        values = {}
+        cols = st.columns(min(3, len(filters)))
+        for i, f in enumerate(filters):
+            key = f"ff_{slug}_{f['id']}"
+            with cols[i % len(cols)]:
+                if f["type"] == "date_range":
+                    st.markdown(f"**{f['label']}**")
+                    a, b = st.columns(2)
+                    values[f["id"]] = {"from": a.date_input("From", value=None, key=key + "_from"),
+                                       "to": b.date_input("To", value=None, key=key + "_to")}
+                elif f["type"] == "choice":
+                    opts_key = f"fopts_{slug}_{f['id']}"
+                    if st.button(f"Load {f['label']} values", key=key + "_load", disabled=not f.get("options_sql")):
+                        if not all(creds):
+                            st.error("Fill in URL, username and password in the sidebar first.")
+                        else:
+                            res, err = run_with_session(creds, timeout_s, lambda sess, f=f: load_options(sess.conn, f["options_sql"]))
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state[opts_key] = res["values"]
+                                if res["truncated"]:
+                                    st.warning("Only the first 500 values are shown. Narrow the options query.")
+                    opts = st.session_state.get(opts_key, [])
+                    if f.get("multi"):
+                        values[f["id"]] = st.multiselect(f["label"], opts, key=key)
+                    else:
+                        picked = st.selectbox(f["label"], ["All"] + opts, key=key)
+                        values[f["id"]] = None if picked == "All" else picked
+                else:
+                    values[f["id"]] = st.text_input(f["label"], key=key)
+        c1, c2 = st.columns(2)
+        apply = c1.button("Apply filters (queries the database)", type="primary", key=f"fapply_{slug}")
+        c2.button("Clear filters", key=f"fclear_{slug}", on_click=clear_filters, args=(slug, filters))
+        if apply:
+            binds, dates = bind_plan(filters, values)
+            uses = [t for t in cfg["tiles"] if tile_uses_filters(t, filters)]
+            if not uses:
+                st.warning("No tile uses these filters yet. Add the placeholders to a tile's SQL in Edit tiles.")
+            elif not all(creds):
+                st.error("URL, username and password are required.")
+            else:
+                bar, status = st.progress(0.0), st.empty()
+
+                def prog(i, n, name):
+                    bar.progress(i / n)
+                    status.info(f"Filtering: {name} (tile {i + 1} of {n}, one database session)")
+
+                res, err = run_with_session(creds, timeout_s, lambda sess: run_filtered(sess, uses, binds, dates, timeout_s, prog))
+                bar.empty()
+                status.empty()
+                if err:
+                    st.warning(err)
+                else:
+                    fview = {"summary": filter_summary(filters, values), "tiles": res}
+                    st.session_state[f"fview_{slug}"] = fview
+    if fview:
+        st.info(f"Filtered view ({fview['summary']}). Numbers are not saved, and baselines and Trend are unchanged. "
+                "Tiles that do not use the filters are dimmed. Click Clear filters to go back.")
+    return fview
+
+
+def validate_filter(f, filters):
+    name = f["name"]
+    if not NAME_OK.fullmatch(name):
+        return "Bind name must be lowercase letters, digits and underscores, start with a letter, and be at most 20 characters."
+    if name in RESERVED:
+        return f"'{name}' is an Oracle reserved word and cannot be a bind name. Pick another."
+    taken = [b for other in filters if other is not f for b in filter_bind_names(other)]
+    if any(b in taken for b in filter_bind_names(f)):
+        return "Another filter already uses this bind name."
+    return ""
+
+
+def sql_hint(f):
+    n = f["name"]
+    if f["type"] == "date_range":
+        return (f"AND (:{n}_from IS NULL OR your_date_column >= :{n}_from)\n"
+                f"AND (:{n}_to IS NULL OR your_date_column <= :{n}_to)")
+    if f["type"] == "choice" and f.get("multi"):
+        return f"AND (:{n} IS NULL OR INSTR(',' || :{n} || ',', ',' || your_column || ',') > 0)"
+    return f"AND (:{n} IS NULL OR your_column = :{n})"
 
 
 def render_editor(slug, cfg, history):
@@ -464,6 +705,7 @@ def render_editor(slug, cfg, history):
         help="A query that runs longer is abandoned and the tile keeps its last good value.",
     )
     to_delete = None
+    fnames = {b for f in cfg["filters"] for b in filter_bind_names(f)}
     for t in cfg["tiles"]:
         k = f'{slug}_{t["id"]}'
         with st.expander(f'{t["name"]}  ({t.get("category", "")})'):
@@ -479,6 +721,9 @@ def render_editor(slug, cfg, history):
                      "e.g. 100 * SUM(CASE WHEN bad THEN 1 ELSE 0 END) / COUNT(*).",
             )
             t["sql"] = st.text_area("SQL", t["sql"], height=120, key=f"q_{k}")
+            used = [n for n in dict.fromkeys(x.lower() for x in BIND_RE.findall(t["sql"])) if n in fnames]
+            if used:
+                st.caption("Uses filters: " + ", ".join(":" + n for n in used))
             if st.button("Delete tile", key=f"d_{k}"):
                 to_delete = t["id"]
     if to_delete:
@@ -486,6 +731,37 @@ def render_editor(slug, cfg, history):
         history.pop(to_delete, None)
         save_json(DASH_DIR / slug / "tiles.json", cfg)
         save_json(DASH_DIR / slug / "history.json", history)
+        st.rerun()
+    st.subheader("Filters")
+    st.caption("A filter is a placeholder you write into a tile's SQL. Tiles without the placeholder ignore the filter. "
+               "Leaving a filter empty means no restriction, so use the (:name IS NULL OR ...) pattern shown under each filter.")
+    del_f = None
+    for f in cfg["filters"]:
+        fk = f"{slug}_{f['id']}"
+        with st.expander(f"{f['label']}  ({FILTER_LABELS.get(f['type'], f['type'])})"):
+            f["label"] = st.text_input("Label shown on the dashboard", f["label"], key=f"fl_{fk}")
+            f["name"] = st.text_input("Bind name used in SQL", f["name"], key=f"fn_{fk}")
+            f["type"] = st.selectbox("Type", FILTER_TYPES, index=FILTER_TYPES.index(f["type"]) if f["type"] in FILTER_TYPES else 2,
+                                     format_func=lambda x: FILTER_LABELS[x], key=f"ft_{fk}")
+            if f["type"] == "choice":
+                f["options_sql"] = st.text_area("Options query (first column, first 500 rows)", f.get("options_sql", ""), height=80, key=f"fo_{fk}",
+                                                help="For example: SELECT DISTINCT branch_name FROM branches ORDER BY 1")
+                f["multi"] = st.checkbox("Allow several values (joined with commas, so values must not contain commas)",
+                                         f.get("multi", False), key=f"fm_{fk}")
+            problem = validate_filter(f, cfg["filters"])
+            if problem:
+                st.error(problem)
+            st.caption("Add this to the tile SQL (dates: the end date includes the whole day):")
+            st.code(sql_hint(f), language="sql")
+            if st.button("Delete filter", key=f"fd_{fk}"):
+                del_f = f["id"]
+    if del_f:
+        cfg["filters"] = [f for f in cfg["filters"] if f["id"] != del_f]
+        save_json(DASH_DIR / slug / "tiles.json", cfg)
+        st.rerun()
+    if st.button("Add filter", key=f"addf_{slug}"):
+        cfg["filters"].append({"id": uuid.uuid4().hex[:8], "label": "New filter", "name": f"filter{len(cfg['filters']) + 1}", "type": "text"})
+        save_json(DASH_DIR / slug / "tiles.json", cfg)
         st.rerun()
     b1, b2 = st.columns(2)
     if b1.button("Add tile", key=f"add_{slug}"):
@@ -564,12 +840,25 @@ with st.sidebar:
 cfg = load_config(slug)
 history = load_json(DASH_DIR / slug / "history.json", {})
 
+def logo_html():
+    for ext, mime in (("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("svg", "image/svg+xml")):
+        p = ASSETS_DIR / f"logo.{ext}"
+        if p.exists():
+            return f'<img src="data:{mime};base64,{base64.b64encode(p.read_bytes()).decode()}" alt="{ORG_NAME}">'
+    return ""
+
+
+_logo = logo_html()
+st.markdown(f'<div class="fb-bar">{_logo}{"" if _logo else f"<span class=fb-name>{ORG_NAME.upper()}</span>"}'
+            f'<span class="fb-sub">Data profiling</span></div>', unsafe_allow_html=True)
 st.title(cfg["title"])
 tab_dash, tab_edit = st.tabs(["Dashboard", "Edit tiles"])
 
 with tab_dash:
     wanted = st.session_state.pop("refresh_ids", None)
     if wanted:
+        for dash in (dashboards if wanted == "everything" else [slug]):
+            st.session_state.pop(f"fview_{dash}", None)  # a normal refresh changes the real numbers, so drop any filtered view
         typed = (url, user, password)  # what is in the sidebar right now, for the open dashboard
 
         def creds_for(dash):
@@ -584,11 +873,13 @@ with tab_dash:
             for dash in dashboards:
                 c = cfg if dash == slug else load_config(dash)
                 histories[dash] = history if dash == slug else load_json(DASH_DIR / dash / "history.json", {})
-                jobs.append({"slug": dash, "tiles": c["tiles"], "creds": creds_for(dash), "timeout_s": float(c["timeout_seconds"])})
+                jobs.append({"slug": dash, "tiles": c["tiles"], "creds": creds_for(dash), "timeout_s": float(c["timeout_seconds"]),
+                             "unset": bind_plan(c["filters"])})
         else:
             to_run = cfg["tiles"] if wanted == "all" else [t for t in cfg["tiles"] if t["id"] in wanted]
             histories = {slug: history}
-            jobs = [{"slug": slug, "tiles": to_run, "creds": typed, "timeout_s": float(cfg["timeout_seconds"])}]
+            jobs = [{"slug": slug, "tiles": to_run, "creds": typed, "timeout_s": float(cfg["timeout_seconds"]),
+                     "unset": bind_plan(cfg["filters"])}]
 
         total = sum(len(j["tiles"]) for j in jobs)
         if total:
@@ -619,7 +910,8 @@ with tab_dash:
                     st.warning(f"Refreshed {total - failed} of {total} tiles{took}. {failed} failed, see the red notes on those tiles.")
                 elif not notes:
                     st.success(f"Refreshed {total} tile(s){took}.")
-    render_dashboard(slug, cfg, history)
+    fview = render_filters(slug, cfg, (url, user, password))
+    render_dashboard(slug, cfg, history, fview)
 
     with st.expander("Lock baseline"):
         st.write("Sets every tile's starting point to its latest refreshed value. 'Since start' and the percentage are measured from here.")

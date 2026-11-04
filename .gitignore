@@ -2,5 +2,6 @@
 dashboards/*/history.json
 dashboards/*/log.jsonl
 oracle_client/
+assets/logo.*
 __pycache__/
 .venv/
