@@ -70,3 +70,13 @@ Filters let people narrow the numbers by date, by a value picked from the databa
 
 ## Header and logo
 Every page shows a Family Bank Limited bar at the top. To show the official logo instead, put your copy at `assets/logo.png` (or `.jpg`, `.svg`). It is gitignored on purpose, so the bank's trademark files are not pushed to GitHub unless you decide otherwise.
+
+## Filters (apply to every tile)
+- In Edit tiles, set **Filter table** (for example `CATM_CHECK_BOOK`) and add filters, each with a **Column** of that table: a date range (`ORDER_DATE`), dropdowns (`BRANCH`, `CHECK_LEAVES`, several values allowed) or free text (contains, ignoring case).
+- You do not edit tile SQL. When you click Apply on the dashboard, every tile query that reads the filter table is rewritten so the table becomes `(SELECT * FROM table WHERE ...)`, keeping any alias. Tiles that do not read that table are dimmed and not run. Each tile's editor shows the SQL as it runs.
+- Filter values are always bind variables. Only the table and column names, checked against a strict pattern, enter the SQL text. A filter with no value adds nothing.
+- Dropdown values are the distinct values of the column (first 500), loaded when you click Load. The end date includes the whole day.
+- **Meaning:** the filter narrows the rows before the tile query runs. Counts, nulls and percentages are right for the chosen scope. A tile that compares rows with each other (for example overlapping cheque book numbers per account) only compares rows inside the scope, so it can miss an overlap with a book that was filtered out.
+- Filtered numbers are a view only. They are never saved, so history, baselines and Trend are unaffected.
+- A filter with no Column still works the old way: write the placeholder (shown in the editor) into the tile SQL yourself.
+- Limits: one filter table per dashboard, matched by name (a table reached only through a view, or a synonym, is not matched). If a tile reads the table in several places, each place is filtered.

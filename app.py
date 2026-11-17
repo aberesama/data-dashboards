@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import oracle_client
+import scope
 
 DASH_DIR = Path("dashboards")
 CATEGORIES = ["Totals", "Nulls", "Invalids"]
@@ -109,6 +110,7 @@ def load_config(slug):
     cfg.setdefault("columns", 4)
     cfg.setdefault("timeout_seconds", 300)
     cfg.setdefault("filters", [])
+    cfg.setdefault("scope_table", "")
     cfg.setdefault("tiles", [])
     return cfg
 
@@ -201,6 +203,11 @@ BIND_RE = re.compile(r"(?<![\w:]):([A-Za-z][A-Za-z0-9_]*)")
 
 def filter_bind_names(f):
     return [f["name"] + "_from", f["name"] + "_to"] if f["type"] == "date_range" else [f["name"]]
+
+
+def manual_filters(cfg):
+    """Filters whose placeholder is written into the tile SQL by hand (no column given)."""
+    return [f for f in cfg["filters"] if not scope.is_auto(f, cfg["scope_table"])]
 
 
 def tile_uses_filters(t, filters):
@@ -423,6 +430,10 @@ def run_filtered(session, tiles, binds, dates, timeout_s, on_progress):
     return out
 
 
+def options_query(f, cfg):
+    return (f.get("options_sql") or "").strip() or scope.default_options_sql(f, cfg["scope_table"])
+
+
 def load_options(conn, sql, cap=500):
     sql = sql.strip().rstrip(";").strip()
     if not READ_ONLY.match(sql):
@@ -566,7 +577,7 @@ def render_dashboard(slug, cfg, history, fview=None):
                 mode, fr = None, None
                 if fview:
                     fr = fview["tiles"].get(t["id"])
-                    mode = "filtered" if fr and tile_uses_filters(t, cfg["filters"]) else "unaffected"
+                    mode = "filtered" if fr else "unaffected"  # only tiles that were filtered were run
                 col.markdown(tile_html(t, history.get(t["id"]), mode, fr), unsafe_allow_html=True)
                 b1, b2 = col.columns(2)
                 b1.button("↻ Refresh", key=f"r_{slug}_{t['id']}", on_click=request_refresh, args=([t["id"]],))
@@ -608,8 +619,10 @@ def render_filters(slug, cfg, creds):
     fview = st.session_state.get(f"fview_{slug}")
     timeout_s = float(cfg["timeout_seconds"])
     with st.expander("Filters", expanded=bool(fview)):
-        st.caption("Pick values, then click Apply. Only tiles whose SQL uses these filters are queried. "
-                   "Filtered numbers are a view only: nothing is saved, and baselines and Trend are not affected.")
+        table = cfg["scope_table"]
+        st.caption("Pick values, then click Apply. "
+                   + (f"Every tile that reads {table} is queried inside your selection. " if table else "")
+                   + "Filtered numbers are a view only: nothing is saved, and baselines and Trend are not affected.")
         values = {}
         cols = st.columns(min(3, len(filters)))
         for i, f in enumerate(filters):
@@ -622,11 +635,12 @@ def render_filters(slug, cfg, creds):
                                        "to": b.date_input("To", value=None, key=key + "_to")}
                 elif f["type"] == "choice":
                     opts_key = f"fopts_{slug}_{f['id']}"
-                    if st.button(f"Load {f['label']} values", key=key + "_load", disabled=not f.get("options_sql")):
+                    oq = options_query(f, cfg)
+                    if st.button(f"Load {f['label']} values", key=key + "_load", disabled=not oq):
                         if not all(creds):
                             st.error("Fill in URL, username and password in the sidebar first.")
                         else:
-                            res, err = run_with_session(creds, timeout_s, lambda sess, f=f: load_options(sess.conn, f["options_sql"]))
+                            res, err = run_with_session(creds, timeout_s, lambda sess, oq=oq: load_options(sess.conn, oq))
                             if err:
                                 st.error(err)
                             else:
@@ -645,42 +659,68 @@ def render_filters(slug, cfg, creds):
         apply = c1.button("Apply filters (queries the database)", type="primary", key=f"fapply_{slug}")
         c2.button("Clear filters", key=f"fclear_{slug}", on_click=clear_filters, args=(slug, filters))
         if apply:
-            binds, dates = bind_plan(filters, values)
-            uses = [t for t in cfg["tiles"] if tile_uses_filters(t, filters)]
-            if not uses:
-                st.warning("No tile uses these filters yet. Add the placeholders to a tile's SQL in Edit tiles.")
+            manual = manual_filters(cfg)
+            summary = filter_summary(filters, values)
+            if summary == "no filter values set":
+                st.warning("Pick at least one filter value first.")
             elif not all(creds):
                 st.error("URL, username and password are required.")
             else:
-                bar, status = st.progress(0.0), st.empty()
+                try:
+                    where, s_binds, s_dates = scope.build_scope(filters, values, table)
+                except ValueError as e:
+                    st.error(str(e))
+                    where = None
+                if where is not None:
+                    m_binds, m_dates = bind_plan(manual, values)
+                    binds, dates = {**m_binds, **s_binds}, m_dates | s_dates
+                    uses = []
+                    for t in cfg["tiles"]:
+                        sql, n = scope.wrap_sql(t["sql"], table, where)
+                        if n or tile_uses_filters(t, manual):
+                            uses.append(dict(t, sql=sql))
+                    if not uses:
+                        st.warning("No tile reads the filter table"
+                                   + (f" ({table})" if table else "")
+                                   + " or uses a filter placeholder, so there is nothing to filter. "
+                                     "Check the filter table and column names in Edit tiles.")
+                    else:
+                        bar, status = st.progress(0.0), st.empty()
 
-                def prog(i, n, name):
-                    bar.progress(i / n)
-                    status.info(f"Filtering: {name} (tile {i + 1} of {n}, one database session)")
+                        def prog(i, n, name):
+                            bar.progress(i / n)
+                            status.info(f"Filtering: {name} (tile {i + 1} of {n}, one database session)")
 
-                res, err = run_with_session(creds, timeout_s, lambda sess: run_filtered(sess, uses, binds, dates, timeout_s, prog))
-                bar.empty()
-                status.empty()
-                if err:
-                    st.warning(err)
-                else:
-                    fview = {"summary": filter_summary(filters, values), "tiles": res}
-                    st.session_state[f"fview_{slug}"] = fview
+                        res, err = run_with_session(creds, timeout_s, lambda sess: run_filtered(sess, uses, binds, dates, timeout_s, prog))
+                        bar.empty()
+                        status.empty()
+                        if err:
+                            st.warning(err)
+                        else:
+                            fview = {"summary": summary, "tiles": res}
+                            st.session_state[f"fview_{slug}"] = fview
     if fview:
         st.info(f"Filtered view ({fview['summary']}). Numbers are not saved, and baselines and Trend are unchanged. "
-                "Tiles that do not use the filters are dimmed. Click Clear filters to go back.")
+                "Tiles that do not read the filtered data are dimmed. Tiles that compare rows with each other only compare rows inside your selection. "
+                "Click Clear filters to go back.")
     return fview
 
 
-def validate_filter(f, filters):
+def validate_filter(f, filters, table):
     name = f["name"]
     if not NAME_OK.fullmatch(name):
-        return "Bind name must be lowercase letters, digits and underscores, start with a letter, and be at most 20 characters."
-    if name in RESERVED:
+        return "Name must be lowercase letters, digits and underscores, start with a letter, and be at most 20 characters."
+    col = f.get("column", "").strip()
+    if col:
+        if not table:
+            return "Set the filter table above first, or clear the column to use a hand written placeholder instead."
+        if not scope.valid_ident(col):
+            return "Column must be a plain column name: letters, digits, _, $ or #, starting with a letter. No quotes or spaces."
+    elif name in RESERVED:
         return f"'{name}' is an Oracle reserved word and cannot be a bind name. Pick another."
     taken = [b for other in filters if other is not f for b in filter_bind_names(other)]
     if any(b in taken for b in filter_bind_names(f)):
-        return "Another filter already uses this bind name."
+        return "Another filter already uses this name."
     return ""
 
 
@@ -705,7 +745,9 @@ def render_editor(slug, cfg, history):
         help="A query that runs longer is abandoned and the tile keeps its last good value.",
     )
     to_delete = None
-    fnames = {b for f in cfg["filters"] for b in filter_bind_names(f)}
+    table = cfg["scope_table"].strip()
+    fnames = {b for f in manual_filters(cfg) for b in filter_bind_names(f)}
+    auto_where = scope.build_scope(cfg["filters"], scope.sample_values(cfg["filters"]), table)[0]
     for t in cfg["tiles"]:
         k = f'{slug}_{t["id"]}'
         with st.expander(f'{t["name"]}  ({t.get("category", "")})'):
@@ -723,7 +765,15 @@ def render_editor(slug, cfg, history):
             t["sql"] = st.text_area("SQL", t["sql"], height=120, key=f"q_{k}")
             used = [n for n in dict.fromkeys(x.lower() for x in BIND_RE.findall(t["sql"])) if n in fnames]
             if used:
-                st.caption("Uses filters: " + ", ".join(":" + n for n in used))
+                st.caption("Uses hand written filter placeholders: " + ", ".join(":" + n for n in used))
+            if auto_where:
+                shown, n = scope.wrap_sql(t["sql"], table, auto_where)
+                if n:
+                    st.caption(f"Filtered automatically: reads {table} ({n} time{'s' if n != 1 else ''}).")
+                    with st.expander("Show the SQL as it runs when every filter is set"):
+                        st.code(shown, language="sql")
+                else:
+                    st.caption(f"Not filtered: this query does not read {table}.")
             if st.button("Delete tile", key=f"d_{k}"):
                 to_delete = t["id"]
     if to_delete:
@@ -733,26 +783,40 @@ def render_editor(slug, cfg, history):
         save_json(DASH_DIR / slug / "history.json", history)
         st.rerun()
     st.subheader("Filters")
-    st.caption("A filter is a placeholder you write into a tile's SQL. Tiles without the placeholder ignore the filter. "
-               "Leaving a filter empty means no restriction, so use the (:name IS NULL OR ...) pattern shown under each filter.")
+    st.caption("Name the table the filters apply to, then give each filter a column of that table. "
+               "On the dashboard, every tile that reads that table is then filtered automatically. You do not edit any tile SQL. "
+               "The filter narrows the rows before the tile query runs, so a tile that compares rows with each other "
+               "(such as overlap checks) only compares rows inside the selection.")
+    cfg["scope_table"] = st.text_input("Filter table", cfg["scope_table"], key=f"scope_{slug}",
+                                       help="For example CATM_CHECK_BOOK or MYSCHEMA.CATM_CHECK_BOOK. Matched by name in every tile query.")
+    if cfg["scope_table"].strip() and not scope.valid_table(cfg["scope_table"].strip()):
+        st.error("Table must be NAME or SCHEMA.NAME using letters, digits, _, $ or #. No quotes or spaces.")
+    cfg["scope_table"] = cfg["scope_table"].strip()
     del_f = None
     for f in cfg["filters"]:
         fk = f"{slug}_{f['id']}"
         with st.expander(f"{f['label']}  ({FILTER_LABELS.get(f['type'], f['type'])})"):
             f["label"] = st.text_input("Label shown on the dashboard", f["label"], key=f"fl_{fk}")
-            f["name"] = st.text_input("Bind name used in SQL", f["name"], key=f"fn_{fk}")
+            f["name"] = st.text_input("Short name", f["name"], key=f"fn_{fk}",
+                                      help="Lowercase letters, digits and underscores. Used internally, and as the placeholder name if you write the SQL by hand.")
             f["type"] = st.selectbox("Type", FILTER_TYPES, index=FILTER_TYPES.index(f["type"]) if f["type"] in FILTER_TYPES else 2,
                                      format_func=lambda x: FILTER_LABELS[x], key=f"ft_{fk}")
+            f["column"] = st.text_input("Column in the filter table", f.get("column", ""), key=f"fc_{fk}",
+                                        help="For example BRANCH. Leave empty to write the placeholder into each tile's SQL yourself.").strip()
             if f["type"] == "choice":
-                f["options_sql"] = st.text_area("Options query (first column, first 500 rows)", f.get("options_sql", ""), height=80, key=f"fo_{fk}",
-                                                help="For example: SELECT DISTINCT branch_name FROM branches ORDER BY 1")
-                f["multi"] = st.checkbox("Allow several values (joined with commas, so values must not contain commas)",
-                                         f.get("multi", False), key=f"fm_{fk}")
-            problem = validate_filter(f, cfg["filters"])
+                f["options_sql"] = st.text_area("Options query (optional)", f.get("options_sql", ""), height=80, key=f"fo_{fk}",
+                                                help="Leave empty to list the distinct values of the column. First column, first 500 rows.")
+                if not f["options_sql"].strip() and scope.is_auto(f, table):
+                    st.caption("Values come from: " + scope.default_options_sql(f, table))
+                f["multi"] = st.checkbox("Allow several values", f.get("multi", False), key=f"fm_{fk}")
+            problem = validate_filter(f, cfg["filters"], table)
             if problem:
                 st.error(problem)
-            st.caption("Add this to the tile SQL (dates: the end date includes the whole day):")
-            st.code(sql_hint(f), language="sql")
+            if scope.is_auto(f, table) and not problem:
+                st.caption(f"Applied automatically to every tile that reads {table}.")
+            elif not f["column"]:
+                st.caption("Hand written mode. Add this to the tile SQL (dates: the end date includes the whole day):")
+                st.code(sql_hint(f), language="sql")
             if st.button("Delete filter", key=f"fd_{fk}"):
                 del_f = f["id"]
     if del_f:
