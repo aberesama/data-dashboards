@@ -1,0 +1,10 @@
+{
+  "templates": [
+    {"label": "Branch (cheque books)", "table": "catm_check_book",
+     "filter": {"label": "Branch", "name": "branch", "type": "choice", "column": "branch", "multi": true}},
+    {"label": "Cheque book size, leaves (cheque books)", "table": "catm_check_book",
+     "filter": {"label": "Cheque book size (leaves)", "name": "leaves", "type": "choice", "column": "check_leaves", "multi": true}},
+    {"label": "Order date (cheque books)", "table": "catm_check_book",
+     "filter": {"label": "Order date", "name": "order_date", "type": "date_range", "column": "order_date"}}
+  ]
+}

@@ -2,32 +2,8 @@
   "title": "Cheques",
   "columns": 4,
   "timeout_seconds": 300,
-  "scope_table": "catm_check_book",
-  "filters": [
-    {
-      "id": "f_branch",
-      "label": "Branch",
-      "name": "branch",
-      "type": "choice",
-      "column": "branch",
-      "multi": true
-    },
-    {
-      "id": "f_leaves",
-      "label": "Cheque book size (leaves)",
-      "name": "leaves",
-      "type": "choice",
-      "column": "check_leaves",
-      "multi": true
-    },
-    {
-      "id": "f_odate",
-      "label": "Order date",
-      "name": "order_date",
-      "type": "date_range",
-      "column": "order_date"
-    }
-  ],
+  "scope_table": "",
+  "filters": [],
   "tiles": [
     {
       "id": "overlap1",

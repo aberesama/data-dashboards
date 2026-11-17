@@ -16,6 +16,7 @@ import oracle_client
 import scope
 
 DASH_DIR = Path("dashboards")
+TEMPLATES_FILE = Path(__file__).resolve().parent / "filter_templates.json"
 CATEGORIES = ["Totals", "Nulls", "Invalids"]
 UNITS = ["count", "percent"]
 ORG_NAME = "Family Bank Limited"
@@ -623,6 +624,12 @@ def render_filters(slug, cfg, creds):
         st.caption("Pick values, then click Apply. "
                    + (f"Every tile that reads {table} is queried inside your selection. " if table else "")
                    + "Filtered numbers are a view only: nothing is saved, and baselines and Trend are not affected.")
+        auto_where = scope.build_scope(filters, scope.sample_values(filters), table)[0]
+        if auto_where:
+            hit = [t["name"] for t in cfg["tiles"] if scope.wrap_sql(t["sql"], table, auto_where)[1]]
+            miss = [t["name"] for t in cfg["tiles"] if t["name"] not in hit]
+            st.caption("Will be filtered: " + (", ".join(hit) if hit else "no tile reads " + table + " yet")
+                       + (". Not affected: " + ", ".join(miss) if miss else "") + ".")
         values = {}
         cols = st.columns(min(3, len(filters)))
         for i, f in enumerate(filters):
@@ -823,6 +830,34 @@ def render_editor(slug, cfg, history):
         cfg["filters"] = [f for f in cfg["filters"] if f["id"] != del_f]
         save_json(DASH_DIR / slug / "tiles.json", cfg)
         st.rerun()
+    templates = load_json(TEMPLATES_FILE, {"templates": []}).get("templates", [])
+    if templates:
+        st.markdown("**Add filters from templates**")
+        pick = st.multiselect("Templates", [t["label"] for t in templates], key=f"tpl_{slug}",
+                              help="Ready made filters. Adding one also sets the filter table if this dashboard has none. Templates live in filter_templates.json.")
+        if st.button("Add selected templates", key=f"addtpl_{slug}", disabled=not pick):
+            problems, added = [], 0
+            for t in templates:
+                if t["label"] not in pick:
+                    continue
+                if cfg["scope_table"] and cfg["scope_table"].lower() != t["table"].lower():
+                    problems.append(f"'{t['label']}' is for {t['table']}, but this dashboard's filter table is {cfg['scope_table']}.")
+                elif any(f["name"] == t["filter"]["name"] for f in cfg["filters"]):
+                    problems.append(f"'{t['label']}' is already on this dashboard.")
+                else:
+                    cfg["scope_table"] = cfg["scope_table"] or t["table"]
+                    cfg["filters"].append({**t["filter"], "id": uuid.uuid4().hex[:8]})
+                    added += 1
+            if added:
+                save_json(DASH_DIR / slug / "tiles.json", cfg)
+            if problems:
+                st.session_state[f"tplmsg_{slug}"] = ("warning", " ".join(problems))
+            if added:
+                st.session_state[f"tplmsg_{slug}"] = ("success", f"Added {added} filter(s)." + (" " + " ".join(problems) if problems else ""))
+            st.rerun()
+        msg = st.session_state.pop(f"tplmsg_{slug}", None)
+        if msg:
+            getattr(st, msg[0])(msg[1])
     if st.button("Add filter", key=f"addf_{slug}"):
         cfg["filters"].append({"id": uuid.uuid4().hex[:8], "label": "New filter", "name": f"filter{len(cfg['filters']) + 1}", "type": "text"})
         save_json(DASH_DIR / slug / "tiles.json", cfg)

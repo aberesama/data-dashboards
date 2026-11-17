@@ -61,7 +61,8 @@ The look follows the Family Bank palette: blue `#2A5BA8` (sampled from the logo)
 The theme sections in `config.toml` need Streamlit 1.51 or newer (`pip install -U streamlit`). Keep both `[theme.light]` and `[theme.dark]`: a single `[theme]` section makes the app ignore your system's dark mode.
 
 ## Filters
-- In Edit tiles, set **Filter table** (for example `CATM_CHECK_BOOK`) and add filters, each with a **Column** of that table: a date range (`ORDER_DATE`), dropdowns (`BRANCH`, `CHECK_LEAVES`, several values allowed) or free text (contains, ignoring case).
+- Ready made filters are templates in `filter_templates.json`. In Edit tiles, Filters, pick templates and click **Add selected templates**. Adding one sets the filter table if the dashboard has none. Add your own templates to that file. A new dashboard starts with no filters.
+- Or do it by hand: in Edit tiles, set **Filter table** (for example `CATM_CHECK_BOOK`) and add filters, each with a **Column** of that table: a date range (`ORDER_DATE`), dropdowns (`BRANCH`, `CHECK_LEAVES`, several values allowed) or free text (contains, ignoring case).
 - You do not edit tile SQL. When you click Apply on the dashboard, every tile query that reads the filter table is rewritten so the table becomes `(SELECT * FROM table WHERE ...)`, keeping any alias. Tiles that do not read that table are dimmed and not run. Each tile's editor shows the SQL as it runs.
 - Filter values are always bind variables. Only the table and column names, checked against a strict pattern, enter the SQL text. A filter with no value adds nothing.
 - Dropdown values are the distinct values of the column (first 500), loaded when you click Load. The end date includes the whole day.
