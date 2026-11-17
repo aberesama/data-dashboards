@@ -1,0 +1,40 @@
+{
+  "title": "Cheques",
+  "columns": 4,
+  "timeout_seconds": 300,
+  "scope_table": "catm_check_book",
+  "filters": [
+    {
+      "id": "f_branch",
+      "label": "Branch",
+      "name": "branch",
+      "type": "choice",
+      "column": "branch",
+      "multi": true
+    },
+    {
+      "id": "f_leaves",
+      "label": "Cheque book size (leaves)",
+      "name": "leaves",
+      "type": "choice",
+      "column": "check_leaves",
+      "multi": true
+    },
+    {
+      "id": "f_odate",
+      "label": "Order date",
+      "name": "order_date",
+      "type": "date_range",
+      "column": "order_date"
+    }
+  ],
+  "tiles": [
+    {
+      "id": "overlap1",
+      "name": "Overlapping cheque books",
+      "category": "Invalids",
+      "unit": "count",
+      "sql": "WITH books AS (\n  SELECT branch, account,\n         TO_NUMBER(first_check_no) AS first_no,\n         check_leaves,\n         TO_NUMBER(first_check_no) + check_leaves AS next_start_no,\n         order_date\n  FROM   catm_check_book\n),\nchained AS (\n  SELECT b.*,\n         MAX(next_start_no) OVER (\n           PARTITION BY account\n           ORDER BY first_no, order_date\n           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING\n         ) AS prior_next_start_no\n  FROM   books b\n)\nSELECT COUNT(*)\nFROM   chained\nWHERE  first_no < prior_next_start_no"
+    }
+  ]
+}
